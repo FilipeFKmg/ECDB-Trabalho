@@ -6,7 +6,7 @@ O objetivo deste projeto é a análise de um conjunto de dados de expressão gen
 ## Conjunto de Dados Selecionado
 **Kidney Renal Clear Cell Carcinoma (TCGA, Firehose Legacy)**
 * **Fonte:** cBioPortal
-* **Tipo de Dados:** Expressão genética (RNA-Seq) e Metadados Clínicos[cite: 19].
+* **Tipo de Dados:** Expressão genética (RNA-Seq) e Metadados Clínicos.
 * **Dimensão:** > 300 amostras (534 amostras de expressão).
 
 ## Organização do Repositório
