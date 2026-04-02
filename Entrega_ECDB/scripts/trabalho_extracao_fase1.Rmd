@@ -1,0 +1,437 @@
+---
+title: "Trabalho Prático 1 - Fase 1"
+subtitle: "Análise transcriptómica do carcinoma de células renais de células claras (TCGA-KIRC)"
+author: "Antonio Araújo (PG59752),
+Filipe Kuhlmann (PG42492),
+Luís Pedrosa (PG58709)"
+date: "2026-03-29"
+output: html_document
+---
+
+# Introdução
+
+O Cancer Genome Atlas (TCGA) é um programa de referência em genómica oncológica que caracterizou molecularmente mais de 20 000 amostras primárias de cancro e amostras normais correspondentes, abrangendo 33 tipos de cancro distintos (Liu et al., 2018). Os dados do dataset em análise dizem respeito a carcinomas de células renais de células claras (ccRCC). Estas células são oncogénicas, resultantes de mutações genéticas que lhes conferem características agressivas e resistência à quimioterapia (Creighton et al., 2013), tendo já demonstrado surgir de alterações em genes envolvidos na regulação do metabolismo celular (Linehan et al., 2010).
+
+O ccRCC é o subtipo mais prevalente de carcinoma de células renais, representando aproximadamente 70% de todos os casos (Young et al., 2024). O prognóstico é fortemente dependente do estadio ao diagnóstico, com taxas de sobrevivência a 5 anos que variam entre 97% no estadio I e menos de 27% no estadio IV (Mattila et al., 2022). Esta discrepância reforça a necessidade de uma caracterização molecular aprofundada para a identificação de biomarcadores de diagnóstico precoce e novos alvos terapêuticos.
+
+A base de dados original do TCGA-KIRC integra múltiplos tipos de dados ómicos, permitindo uma caracterização molecular muito abrangente. No seu estudo fundamental, o TCGA avaliou não só características clínicas e patológicas, mas também alterações genómicas (CNA), perfis de metilação do DNA e assinaturas proteómicas (RPPA) para centenas de pacientes.
+
+No entanto, no âmbito do presente trabalho prático, o foco incidirá exclusivamente sobre a transcriptómica. Para tal, foram extraídos os dados de expressão de mRNA (RNA-seq), processados sob a forma de contagens brutas pelo pipeline STAR, juntamente com a informação clínica associada aos pacientes. O objetivo passa por aplicar técnicas de exploração e análise de expressão diferencial entre tecidos tumorais sólidos primários e o tecidos normais adjacentes, tentado desvendar a reprogramação genética subjacente à doença.
+
+## 1. Preparação do Ambiente
+
+Nesta etapa inicial, garantimos o carregamento de todas as bibliotecas do R e ferramentas do Bioconductor necessárias para a importação, manipulação, normalização e visualização dos dados.
+
+```{r, message=FALSE, warning=FALSE}
+# Instalações necessárias (descomentar se for a primeira execução)
+#install.packages("BiocManager")
+#installed.packages("Rtools")
+#BiocManager::install(c("TCGAbiolinks", "SummarizedExperiment", "edgeR", "DESeq2", "clusterProfiler", #"org.Hs.eg.db"))
+
+# Carregar as ferramentas essenciais
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+```
+
+## 2. Aquisição de Dados
+
+Utilizamos o pacote TCGAbiolinks para realizar a query e o download da matriz de expressão genética diretamente da base de dados GDC. Focamo-nos na quantificação de expressão genética utilizando o pipeline STAR.
+
+```{r, message=FALSE, warning=FALSE}
+# Preparar a query para extração dos dados transcriptómicos
+query_kirc <- GDCquery(
+  project = "TCGA-KIRC",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+# Descarregar e preparar o objeto SummarizedExperiment
+GDCdownload(query_kirc)
+dados_kirc <- GDCprepare(query_kirc)
+
+# Extrair a matriz de contagens brutas e os metadados associados
+matriz_bruta <- assay(dados_kirc, "unstranded")
+metadados <- as.data.frame(colData(dados_kirc))
+```
+
+Para garantir que o dataset cumpre o requisito mínimo exigido de 300 amostras, verificamos as dimensões da matriz extraída:
+
+```{r}
+dim(matriz_bruta)
+```
+
+**Interpretação**: O dataset original contém um número de amostras francamente superior ao mínimo exigido (300 amostras), validando a sua utilização e garantindo robustez estatística para este estudo.
+
+## 3. Seleção de Amostras, Limpeza e Normalização
+
+Antes de qualquer normalização, é crucial isolar apenas as amostras de interesse biológico (Tumor Sólido Primário vs. Tecido Normal), excluindo outras amostras que possam introduzir ruído. Posteriormente, filtramos genes com expressão residual e aplicamos o método TMM (Trimmed Mean of M-values).
+
+```{r}
+# 1. Selecionar exclusivamente as amostras tumorais primárias e normais
+amostras_validas <- metadados$definition %in% c("Primary solid Tumor", "Solid Tissue Normal")
+
+# 2. Filtrar os metadados e a matriz bruta
+metadados_filtrados <- metadados[amostras_validas, ]
+matriz_raw_filtrada <- matriz_bruta[, amostras_validas]
+
+# 3. Converter para objeto DGEList (edgeR)
+dge <- DGEList(counts = matriz_raw_filtrada)
+grupos <- metadados_filtrados$definition
+
+# 4. Filtrar genes de baixa expressão com base no desenho experimental
+genes_a_manter <- filterByExpr(dge, group = grupos)
+dge_filtrado <- dge[genes_a_manter, , keep.lib.sizes = FALSE]
+
+# 5. Estimar fatores de normalização pelo método TMM
+dge_filtrado <- calcNormFactors(dge_filtrado, method = "TMM")
+
+# 6. Gerar matriz de Log-CPM para visualizações e guardar raw counts para DESeq2
+matriz_normalizada <- cpm(dge_filtrado, log = TRUE)
+matriz_raw_filtrada <- dge_filtrado$counts
+```
+
+## 4. Exploração Visual e Estatística Descritiva
+
+### 4.1 Sumarização clínica das amostras
+
+Realizou-se a sumarização clínica das amostras com base nos metadados previamente filtrados. O objetivo é caracterizar a composição do conjunto de dados que será utilizado nas análises seguintes, identificando a distribuição das amostras entre tecido tumoral primário e tecido normal, bem como algumas das suas principais características demográficas e clínicas.
+
+```{r}
+table(metadados_filtrados$definition)
+table(metadados_filtrados$gender)
+table(metadados_filtrados$ajcc_pathologic_stage)
+summary(metadados_filtrados$age_at_index)
+```
+ 
+**Interpretação**: O conjunto final incluiu 541 amostras tumorais e 72 amostras normais, evidenciando um desequilíbrio entre grupos. Relativamente ao sexo, observaram-se 405 amostras masculinas e 208 femininas. A distribuição por estádio patológico mostrou predominância de casos em Stage I, seguindo-se Stage III e Stage IV, embora parte das amostras não apresentasse informação de estádio disponível. Quanto à idade, a mediana foi de 61 anos e a média de 60.91 anos, com valores entre 26 e 89 anos.
+
+### 4.2 Visualização clínica por gráficos
+
+Procedemos à representação gráfica das principais variáveis clínicas das amostras filtradas, com o objetivo de facilitar a visualização da sua distribuição. Para isso, foram construídos gráficos relativos ao tipo de tecido, sexo, estádio patológico e idade, permitindo obter uma perspetiva visual da composição do conjunto de dados utilizado na análise.
+
+```{r}
+par(mfrow = c(2, 2)) # Layout para 4 gráficos
+
+# Gráfico da distribuição do tipo de amostra
+barplot(table(metadados_filtrados$definition),
+        las = 1, col = c("red", "steelblue"),
+        main = "Distribuição por Tipo de Tecido", ylab = "Número de amostras")
+
+# Gráfico da distribuição por sexo
+barplot(table(metadados_filtrados$gender),
+        las = 1, col = c("purple", "skyblue"),
+        main = "Distribuição por Sexo", ylab = "Número de amostras")
+
+# Gráfico da distribuição por estádio patológico
+barplot(table(metadados_filtrados$ajcc_pathologic_stage),
+        las = 2, cex.names = 0.7, col = "brown",
+        main = "Estádio Patológico (AJCC)", ylab = "Número de amostras")
+
+# Histograma das idades
+hist(metadados_filtrados$age_at_index,
+     breaks = 20, col = "lightgreen",
+     main = "Distribuição Etária", xlab = "Idade (anos)")
+
+par(mfrow = c(1, 1)) # Repor layout original
+```
+
+**Interpretação**: Os gráficos mostram uma predominância clara de amostras de tumor sólido primário relativamente ao tecido normal, bem como uma maior representação do sexo masculino. No que respeita ao estádio patológico, observa-se maior frequência de casos em Stage I, seguindo-se os estádios III, IV e II, enquanto os restantes têm expressão reduzida. A distribuição etária apresenta maior concentração entre os 50 e os 70 anos, com valores centrados em torno dos 60 anos.
+
+### 4.3 Exploração global da expressão de genes
+
+Neste tópico avaliou-se a distribuição global da expressão génica utilizando a matriz normalizada em log-CPM. Para esse efeito, foram construídos um boxplot por amostra, limitado a uma subamostra de 50 para facilitar a legibilidade, e um histograma com todos os valores de expressão. O objetivo foi verificar a comparabilidade global entre amostras e observar a forma geral da distribuição dos valores de expressão após a normalização.
+
+```{r}
+# Boxplot global por amostra (limitado às primeiras 50 amostras para legibilidade)
+boxplot(matriz_normalizada[,1:50],
+        outline = FALSE, xaxt = "n",
+        col = ifelse(metadados_filtrados$definition[1:50] == "Primary solid Tumor", "red", "steelblue"),
+        main = "Distribuição Global da Expressão (Subamostra de 50)", ylab = "log-CPM")
+
+legend("topright", legend = c("Tumor", "Normal"), fill = c("red", "steelblue"), bty = "n")
+
+# Histograma global dos valores de expressão
+hist(as.numeric(matriz_normalizada),
+     breaks = 100, col = "gray",
+     main = "Distribuição Global da Expressão de Genes", xlab = "log-CPM")
+```
+
+**Interpretação**: O boxplot mostra distribuições globalmente semelhantes entre as amostras representadas, com medianas próximas e dispersões comparáveis, o que sugere boa consistência entre bibliotecas após a normalização e ausência de outliers evidentes nesta subamostra. O histograma revela uma forte concentração de valores baixos de expressão, acompanhada por outras zonas de maior densidade em níveis intermédios e mais elevados, refletindo a coexistência de genes pouco expressos e genes com expressão mais marcada. No conjunto, os resultados indicam que os dados normalizados apresentam um comportamento global coerente e adequado para prosseguir com a exploração e análise estatística.
+
+## 5. Análise de genes de interesse biológico
+
+Identificou-se genes de interesse biológico como o VHL e PTEN na anotação do dataset, com o objetivo de os localizar corretamente antes da análise individual da sua expressão. A escolha destes dois genes justifica-se pela sua relevância no carcinoma de células renais claras. O VHL é um dos genes mais centrais nesta doença, estando o ccRCC fortemente associado a alterações neste locus, incluindo perda do braço curto do cromossoma 3 e silenciamento epigenético em parte dos tumores. Já o PTEN destaca-se pela sua associação à via PI(3)K/AKT/MTOR, também apontada no estudo original como relevante para a progressão tumoral e potencial interesse terapêutico. Assim, nesta etapa extraiu-se a informação de anotação dos genes e procuraram-se os identificadores Ensembl correspondentes a VHL e PTEN, de forma a permitir a sua análise específica nas etapas seguintes (The Cancer Genome Atlas Research Network (2013).
+
+```{r}
+# Extrair informação de anotação dos genes
+genes_info <- as.data.frame(rowData(dados_kirc))
+genes_info$ensembl_id <- rownames(genes_info)
+
+# Mapear e isolar os IDs Ensembl correspondentes a VHL e PTEN
+id_vhl <- rownames(genes_info)[genes_info$gene_name == "VHL"]
+id_pten <- rownames(genes_info)[genes_info$gene_name == "PTEN"]
+
+print(paste("ID do VHL mapeado:", id_vhl))
+print(paste("ID do PTEN mapeado:", id_pten))
+```
+
+### 5.1 Análise univariada (Teste de Wilcoxon)
+
+Procedemos à comparação das medianas de expressão (log-CPM) entre os grupos tumoral e normal, utilizando o teste não-paramétrico de Wilcoxon. Análise univariada (Teste de Wilcoxon)
+
+```{r}
+# Preparação e Teste para o gene VHL
+
+expr_vhl <- matriz_normalizada[id_vhl, ]
+dados_vhl <- data.frame(expressao = as.numeric(expr_vhl), grupo = metadados_filtrados$definition)
+
+boxplot(expressao ~ grupo, data = dados_vhl,
+        col = c("red", "steelblue"),
+        main = "Expressão do Gene VHL", ylab = "Expressão (log-CPM)", xlab = "Condição Clínica")
+
+wilcox.test(expressao ~ grupo, data = dados_vhl)
+```
+
+**Interpretação**: A expressão do gene VHL é globalmente mais baixa nas amostras tumorais do que no tecido normal, com uma mediana inferior no grupo Primary solid Tumor. Observa-se ainda maior variabilidade no grupo tumoral. Este resultado é compatível com o papel central do VHL no ccRCC.
+
+```{r}
+# Preparação e Teste para o gene PTEN
+expr_pten <- matriz_normalizada[id_pten, ]
+dados_pten <- data.frame(expressao = as.numeric(expr_pten), grupo = metadados_filtrados$definition)
+
+boxplot(expressao ~ grupo, data = dados_pten,
+        col = c("red", "steelblue"),
+        main = "Expressão do Gene PTEN", ylab = "Expressão (log-CPM)", xlab = "Condição Clínica")
+
+wilcox.test(expressao ~ grupo, data = dados_pten)
+```
+
+**Interpretação**: A expressão do gene PTEN apresenta valores muito semelhantes entre as amostras tumorais e normais, com medianas próximas nos dois grupos. Observa-se apenas uma ligeira maior variabilidade no grupo tumoral. Globalmente, o gráfico não sugere uma diferença visual marcada de expressão entre as duas condições.
+
+## 6. Análise de Expressão Diferencial (DESeq2)
+
+### 6.1 Identificação dos genes diferencialmente expressos
+
+O método DESeq2 utiliza um modelo estatístico baseado na distribuição binomial negativa, adequado para lidar com a variabilidade biológica inerente ao RNA-seq.
+
+```{r, message=FALSE, warning=FALSE}
+
+metadados_filtrados$definition <- factor(metadados_filtrados$definition)
+metadados_filtrados$definition <- relevel(metadados_filtrados$definition, ref = "Solid Tissue Normal")
+# Instanciar o modelo DESeq2 a partir da matriz filtrada de contagens brutas
+dds <- DESeqDataSetFromMatrix(
+  countData = matriz_raw_filtrada,
+  colData = metadados_filtrados,
+  design = ~ definition
+)
+
+# Estimação de dispersões e ajustamento do modelo
+dds <- DESeq(dds)
+
+# Extrair os resultados estatísticos do contraste Tumor vs. Normal
+res <- results(dds, contrast = c("definition", "Primary solid Tumor", "Solid Tissue Normal"))
+res <- res[order(res$padj), ] # Ordenar por p-value ajustado
+
+# Limpeza e anotação dos IDs (remoção de versões após o ponto)
+res_df <- as.data.frame(res)
+res_df$ensembl_id <- rownames(res_df)
+genes_info$ensembl_clean <- sub("\\..*", "", genes_info$ensembl_id)
+res_df$ensembl_clean <- sub("\\..*", "", res_df$ensembl_id)
+
+anotacao_limpa <- unique(genes_info[, c("ensembl_clean", "gene_name")])
+
+# Fundir os resultados com o mapeamento original de genes
+res_annot <- merge(res_df, anotacao_limpa, by = "ensembl_clean", all.x = TRUE)
+
+# Definir os limiares de significância (|log2FC| > 1 e p-value ajustado < 0.05)
+res_annot$significativo <- "Nao significativo"
+res_annot$significativo[!is.na(res_annot$padj) & res_annot$padj < 0.05 & abs(res_annot$log2FoldChange) > 1] <- "Significativo"
+
+# Mostrar as primeiras linhas dos genes mais significativos
+head(res_annot[order(res_annot$padj), ])
+
+# Contagem de DEGs encontrados
+table(res_annot$significativo)
+```
+
+**Interpretação**: Foram identificados 10.310 genes significativamente alterados no tumor (usando como critérios $|\log_2 FC| > 1$ e $p_{adj} < 0.05$).
+
+### 6.2 Visualização global da significância e magnitude (Volcano Plot)
+
+O Volcano Plot permite contrastar visualmente o fold-change (eixo X) com a robustez estatística (eixo Y) das alterações de expressão.
+
+```{r}
+ggplot(res_annot, aes(x = log2FoldChange, y = -log10(padj), color = significativo)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("gray", "red")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot - Tumor Sólido vs. Tecido Normal",
+    x = "Log2 Fold Change (Magnitude)",
+    y = "-Log10 Padj (Significância)"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+### 6.3 Padrões de expressão e separação entre grupos (Heatmap)
+
+Extraímos os 50 genes (DEGs) mais significativos do modelo estatístico e avaliamos os seus padrões numa escala de cores. O objetivo é verificar se este top 50 é suficiente para criar aglomerados (clusters) que separem perfeitamente pacientes saudáveis dos pacientes com tumor.
+
+```{r}
+# Selecionar top 50 DEGs (IDs limpos, sem versão)
+top50_clean <- head(res_annot$ensembl_clean[order(res_annot$padj)], 50)
+
+# Mapear IDs limpos para os originais com versão na matriz normalizada
+ids_matriz <- rownames(matriz_normalizada)
+ids_clean_matriz <- sub("\\..*", "", ids_matriz)
+top50_com_versao <- ids_matriz[ids_clean_matriz %in% top50_clean]
+
+# Subconjunto da matriz log-CPM
+matriz_top50 <- matriz_normalizada[top50_com_versao, ]
+
+# Anotação das colunas (condição clínica)
+anot <- data.frame(Grupo = metadados_filtrados$definition)
+rownames(anot) <- colnames(matriz_top50)
+
+# Gerar o Heatmap
+pheatmap(matriz_top50,
+         scale = "row",
+         annotation_col = anot,
+         show_rownames = TRUE,      
+         show_colnames = FALSE,     
+         fontsize_row = 7,          
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         main = "Top 50 DEGs - Diferenciação Transcriptómica")
+```
+
+**Interpretação**: O heatmap evidencia um conjunto de 50 genes diferencialmente expressos que distinguem de forma clara o tecido tumoral do tecido normal, pela criação de dois clusters primários bem definidos que refletem padrões transcriptómicos marcadamente distintos entre ambas as condições.
+
+## 7. Análise de Enriquecimento Funcional (Gene Ontology)
+
+Na etapa final da Fase 1, aplicamos uma análise de enriquecimento para mapear os genes significativos em vias e processos biológicos (Biological Processes) conhecidos. Para uma melhor interpretação biológica, dividimos a análise em vias sobrexpressas (ativadas pelo tumor) e subexpressas (reprimidas pelo tumor).
+
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# Separar os genes sobrexpressos (Up) e subexpressos (Down)
+genes_up <- res_annot$ensembl_clean[res_annot$significativo == "Significativo" & res_annot$log2FoldChange > 1]
+genes_down <- res_annot$ensembl_clean[res_annot$significativo == "Significativo" & res_annot$log2FoldChange < -1]
+
+# Enriquecimento para Genes Sobrexpressos (Up-regulated)
+ego_up <- enrichGO(gene          = genes_up,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = 'ENSEMBL',
+                   ont           = "BP", 
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+# Enriquecimento para Genes Subexpressos (Down-regulated)
+ego_down <- enrichGO(gene          = genes_down,
+                     OrgDb         = org.Hs.eg.db,
+                     keyType       = 'ENSEMBL',
+                     ont           = "BP", 
+                     pAdjustMethod = "BH",
+                     pvalueCutoff  = 0.05,
+                     readable      = TRUE)
+
+# Visualização: Dotplot dos Sobrexpressos
+plot_up <- dotplot(ego_up, showCategory=12) + 
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 45)) + 
+  theme_bw() + 
+  labs(title = "Processos Biológicos Sobrexpressos (Ativados no Tumor)",
+       subtitle = "Gene Ontology - Up-regulated Genes")
+
+# Visualização: Dotplot dos Subexpressos
+plot_down <- dotplot(ego_down, showCategory=12) + 
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 45)) + 
+  theme_bw() + 
+  labs(title = "Processos Biológicos Subexpressos (Reprimidos no Tumor)",
+       subtitle = "Gene Ontology - Down-regulated Genes")
+
+# Imprimir os gráficos
+plot_up
+plot_down
+```
+
+**Interpretação**: Relativamente ao dotplot dos genes sobrexpressos, verifica-se que os processos biológicos mais afetados estão quase exclusivamente ligados à proliferação, ativação e diferenciação de células do sistema imunitário (leucócitos, linfócitos, células T e B). Este resultado vai diretamente ao encontro do descrito na literatura para esta patologia, uma vez que o ccRCC está associado ao recrutamento de uma forte resposta inflamatória, caracterizada pela infiltração massiva de células imunitárias, incluindo células T, células B e células natural killer, para o microambiente tumoral (Monjaras-Avila et al., 2023). Tal fenómeno consegue explicar a presença de elevadas expressão de genes relacionados com o sistema imunitário.
+
+Por outro lado, a análise dos genes subexpressos ilustra as consequências da progressão tumoral no tecido de origem. Os processos mais significativamente reprimidos envolvem o desenvolvimento do sistema renal e do nefrónio, o transporte transmembranar de iões (como o sódio) e o catabolismo de ácidos orgânicos e de pequenas moléculas. Em conjunto, estes dados demonstram que as células tumorais sofrem uma profunda desdiferenciação, perdendo a sua identidade celular especializada e abandonando as funções fisiológicas normais de filtração e regulação metabólica típicas de células de um rim saudável. Este processo de perda de identidade funcional é uma característica central do ccRCC (Kim & Rossi, 2008).
+
+## 8. Análise de Vias Metabólicas e de Sinalização (KEGG)
+
+De modo a complementar a análise de processos biológicos e explorar a profunda alteração metabólica característica do ccRCC, realizou-se uma análise de enriquecimento recorrendo à base de dados KEGG (Kyoto Encyclopedia of Genes and Genomes).
+
+```{r, message=FALSE, warning=FALSE}
+
+# Primeiramente conversão dos identificadores Ensembl para Entrez ID.
+
+genes_up_entrez <- bitr(genes_up, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+genes_down_entrez <- bitr(genes_down, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Enriquecimento KEGG para Genes Sobrexpressos
+
+kegg_up <- enrichKEGG(gene         = genes_up_entrez$ENTREZID,
+                      organism     = 'hsa',
+                      pvalueCutoff = 0.05)
+
+# Enriquecimento KEGG para Genes Subexpressos
+
+kegg_down <- enrichKEGG(gene         = genes_down_entrez$ENTREZID,
+                        organism     = 'hsa',
+                        pvalueCutoff = 0.05)
+
+# Visualização KEGG: Sobrexpressos
+
+plot_kegg_up <- dotplot(kegg_up, showCategory=10) + 
+  theme_bw() + 
+  labs(title = "Vias KEGG Sobrexpressas (Ativadas no Tumor)",
+       subtitle = "KEGG Pathway Enrichment - Up-regulated Genes")
+
+# Visualização KEGG: Subexpressos
+
+plot_kegg_down <- dotplot(kegg_down, showCategory=10) + 
+  theme_bw() + 
+  labs(title = "Vias KEGG Subexpressas (Reprimidas no Tumor)",
+       subtitle = "KEGG Pathway Enrichment - Down-regulated Genes")
+
+# Imprimir os gráficos
+plot_kegg_up
+plot_kegg_down
+```
+
+**Interpretação**: Relativamente aos resultados da análise KEGG para os genes sobrexpressos, verifica-se que o perfil é esmagadoramente dominado por genes que estão integrados em vias de resposta imunitária e inflamatória, com especial destaque para os genes associados à via de interação citocina-recetor de citocina e às moléculas de adesão celular (CAMs). Este resultado vai diretamente ao encontro do descrito na literatura para esta patologia, evidenciando um ambiente de intensa comunicação intercelular, adesão e recrutamento ativo de leucócitos, que é essencial para a formação do complexo microambiente tumoral rico em células imunitárias típico do ccRCC (Monjaras-Avila et al., 2023). Tal fenómeno consegue também explicar a elevada expressão de genes mapeados pelo KEGG em vias tipicamente associadas a doenças autoimunes ou à rejeição de transplantes (Graft-versus-host disease e Allograft rejection), o que não reflete a presença clínica destas patologias, mas sim o estado de severa hiperativação imunitária desencadeada no tumor.
+
+Por outro lado, a análise dos genes subexpressos ilustra as consequências da profunda desregulação metabólica associada à progressão tumoral. A análise do KEGG indica que os genes mais significativamente reprimidos estão sobretudo integrados nas vias do metabolismo do carbono e no catabolismo de aminoácidos essenciais, uma observação para o ccRCC amplamente corroborada pela literatura (Wettersten et al., 2017; Xie et al., 2026). Verifica-se ainda uma inibição acentuada na expressão de genes pertencentes à via de sinalização PPAR. Como esta via participa na regulação da oxidação de ácidos gordos, a supressão destes genes promove a acumulação intracelular de lípidos e glicogénio uma acumulação típica do ccRCC (Wettersten et al., 2017; Li et al., 2026). Por último, é possível observar que os genes integrados em vias relacionadas com as funções fisiológicas e de regulação típicas de um rim saudável, como a secreção de ácido no túbulo coletor (Qu et al., 2022), também se encontram marcadamente subexpressos nos tecidos tumorais.
+
+**Referências:**
+
+Cancer Genome Atlas Research Network. (2013). Comprehensive molecular characterization of clear cell renal cell carcinoma. *Nature*, *499*(7456), 43–49. https://doi.org/10.1038/nature12222
+
+Hu, J., Wang, S.-G., Hou, Y., Chen, Z., Liu, L., Li, R., Li, N., Zhou, L., Yang, Y., Wang, L., Wang, L., Yang, X., Lei, Y., Deng, C., Li, Y., Deng, Z., Ding, Y., Kuang, Y., Yao, Z., ... Li, F. (2024). Multi-omic profiling of clear cell renal cell carcinoma identifies metabolic reprogramming associated with disease progression. *Nature Genetics*, *56*(3), 442–457. https://doi.org/10.1038/s41588-024-01662-5
+
+Kim, D. H., & Rossi, J. J. (2008). RNAi mechanisms and applications. *BioTechniques*, *44*(5), 613–616. https://doi.org/10.2144/000112792
+
+Li, Q., Shi, Z., Shi, X., Xing, H., Zhang, Y., Zhuang, S., & Chang, M. (2026). Peroxisome proliferator-activated receptors in kidney diseases: A promising therapeutic target. *Biomedicine & Pharmacotherapy*, *195*, Artigo 118983. https://doi.org/10.1016/j.biopha.2026.118983
+
+Linehan, W. M., Srinivasan, R., & Schmidt, L. S. (2010). The genetic basis of kidney cancer: A metabolic disease. *Nature Reviews Urology*, *7*(5), 277–285. https://doi.org/10.1038/nrurol.2010.47
+
+Liu, J., Lichtenberg, T., Hoadley, K. A., Poisson, L. M., Lazar, A. J., Cherniack, A. D., Kovatich, A. J., Benz, C. C., Levine, D. A., Lee, A. V., Omberg, L., Wolf, D. M., Shriver, C. D., Thorsson, V., Hu, H., Caesar-Johnson, S. J., Demchok, J. A., Felau, I., ... Zhang, J. J. (2018). An integrated TCGA pan-cancer clinical data resource to drive high-quality survival outcome analytics. *Cell*, *173*(2), 400–416.e11. https://doi.org/10.1016/j.cell.2018.02.052
+
+Mattila, K. E., Vainio, P., & Jaakkola, P. M. (2022). Prognostic factors for localized clear cell renal cell carcinoma and their application in adjuvant therapy. *Cancers*, *14*(1), Artigo 239. https://doi.org/10.3390/cancers14010239
+
+Monjaras-Avila, C. U., Lorenzo-Leal, A. C., Luque-Badillo, A. C., D’Costa, N., Chavez-Muñoz, C., & Bach, H. (2023). The tumor immune microenvironment in clear cell renal cell carcinoma. *International Journal of Molecular Sciences*, *24*(9), Artigo 7946. https://doi.org/10.3390/ijms24097946
+
+Qu, Y., Feng, J., Wu, X., Bai, L., Xu, W., Zhu, L., Liu, Y., Xu, F., Zhang, X., Yang, G., Lv, J., Chen, X., Shi, G.-H., Wang, H.-K., Cao, D.-L., Xiang, H., Li, L., Tan, S., Gan, H.-L., ... Ding, C. (2022). A proteogenomic analysis of clear cell renal cell carcinoma in a Chinese population. *Nature Communications*, *13*(1), Artigo 2052. https://doi.org/10.1038/s41467-022-29577-x
+
+Wettersten, H. I., Aboud, O. A., Lara, P. N., & Weiss, R. H. (2017). Metabolic reprogramming in clear cell renal cell carcinoma. *Nature Reviews Nephrology*, *13*(7), 410–419. https://doi.org/10.1038/nrneph.2017.59
+
+Xie, J., Ni, F., Shao, J., Zhang, D., Guo, T., & Wang, X. (2026). Amino acid metabolic reprogramming in clear cell renal cell carcinoma: Pathogenic mechanisms and therapeutic targeting. *Cancer Letters*, *640*, Artigo 218244. https://doi.org/10.1016/j.canlet.2026.218244
+
+Young, M., Jackson-Spence, F., Beltran, L., Day, E., Suarez, C., Bex, A., Powles, T., & Szabados, B. (2024). Renal cell carcinoma. *The Lancet*, *404*(10451), 476–491. https://doi.org/10.1016/S0140-6736(24)00917-6
