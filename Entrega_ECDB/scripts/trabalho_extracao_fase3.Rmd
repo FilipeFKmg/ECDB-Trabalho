@@ -1,0 +1,1656 @@
+---
+title: "Trabalho Prático 1 - Fase 1"
+subtitle: "Análise transcriptómica do carcinoma de células renais de células claras (TCGA-KIRC)"
+author: "Antonio Araújo (PG59752),
+Filipe Kuhlmann (PG42492),
+Luís Pedrosa (PG58709)"
+date: "2026-03-29"
+output: html_document
+---
+
+# Introdução
+
+O Cancer Genome Atlas (TCGA) é um programa de referência em genómica oncológica que caracterizou molecularmente mais de 20 000 amostras primárias de cancro e amostras normais correspondentes, abrangendo 33 tipos de cancro distintos (Liu et al., 2018). Os dados do dataset em análise dizem respeito a carcinomas de células renais de células claras (ccRCC). Estas células são oncogénicas, resultantes de mutações genéticas que lhes conferem características agressivas e resistência à quimioterapia (Creighton et al., 2013), tendo já demonstrado surgir de alterações em genes envolvidos na regulação do metabolismo celular (Linehan et al., 2010).
+
+O ccRCC é o subtipo mais prevalente de carcinoma de células renais, representando aproximadamente 70% de todos os casos (Young et al., 2024). O prognóstico é fortemente dependente do estadio ao diagnóstico, com taxas de sobrevivência a 5 anos que variam entre 97% no estadio I e menos de 27% no estadio IV (Mattila et al., 2022). Esta discrepância reforça a necessidade de uma caracterização molecular aprofundada para a identificação de biomarcadores de diagnóstico precoce e novos alvos terapêuticos.
+
+A base de dados original do TCGA-KIRC integra múltiplos tipos de dados ómicos, permitindo uma caracterização molecular muito abrangente. No seu estudo fundamental, o TCGA avaliou não só características clínicas e patológicas, mas também alterações genómicas (CNA), perfis de metilação do DNA e assinaturas proteómicas (RPPA) para centenas de pacientes.
+
+No entanto, no âmbito do presente trabalho prático, o foco incidirá exclusivamente sobre a transcriptómica. Para tal, foram extraídos os dados de expressão de mRNA (RNA-seq), processados sob a forma de contagens brutas pelo pipeline STAR, juntamente com a informação clínica associada aos pacientes. O objetivo passa por aplicar técnicas de exploração e análise de expressão diferencial entre tecidos tumorais sólidos primários e o tecidos normais adjacentes, tentado desvendar a reprogramação genética subjacente à doença.
+
+## 1. Preparação do Ambiente
+
+Nesta etapa inicial, garantimos o carregamento de todas as bibliotecas do R e ferramentas do Bioconductor necessárias para a importação, manipulação, normalização e visualização dos dados.
+
+```{r, message=FALSE, warning=FALSE}
+# Instalações necessárias (descomentar apenas se for a primeira execução e depois voltar a comentar)
+#install.packages("BiocManager")
+#BiocManager::install(c("TCGAbiolinks", "SummarizedExperiment", "edgeR", "DESeq2", "clusterProfiler", "org.Hs.eg.db"))
+#install.packages(c("umap", "Rtsne", "factoextra"))
+#install.packages(c("randomForest", "caret", "pROC", "smotefamily", "dplyr", "ggplot2", "e1071"))
+
+# Carregar as ferramentas essenciais
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Ferramentas da Fase 2
+library(umap)
+library(Rtsne)
+library(factoextra)
+
+# Ferramentas da Fase 3
+library(e1071)
+library(randomForest)
+library(caret)
+library(pROC)
+library(smotefamily)
+library(ggplot2)
+library(dplyr)
+library(pls)
+```
+
+## 2. Aquisição de Dados
+
+Utilizamos o pacote TCGAbiolinks para realizar a query e o download da matriz de expressão genética diretamente da base de dados GDC. Focamo-nos na quantificação de expressão genética utilizando o pipeline STAR.
+
+```{r}
+# Preparar a query para extração dos dados transcriptómicos
+query_kirc <- GDCquery(
+  project = "TCGA-KIRC",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+# Descarregar e preparar o objeto SummarizedExperiment
+GDCdownload(query_kirc)
+dados_kirc <- GDCprepare(query_kirc)
+
+# Extrair a matriz de contagens brutas e os metadados associados
+matriz_bruta <- assay(dados_kirc, "unstranded")
+metadados <- as.data.frame(colData(dados_kirc))
+```
+
+Para garantir que o dataset cumpre o requisito mínimo exigido de 300 amostras, verificamos as dimensões da matriz extraída:
+
+```{r}
+dim(matriz_bruta)
+```
+
+*Interpretação*: O dataset original contém um número de amostras francamente superior ao mínimo exigido (300 amostras), validando a sua utilização e garantindo robustez estatística para este estudo.
+
+## 3. Seleção de Amostras, Limpeza e Normalização
+
+Antes de qualquer normalização, é crucial isolar apenas as amostras de interesse biológico (Tumor Sólido Primário vs. Tecido Normal), excluindo outras amostras que possam introduzir ruído. Posteriormente, filtramos genes com expressão residual e aplicamos o método TMM (Trimmed Mean of M-values).
+
+```{r}
+# 1. Selecionar exclusivamente as amostras tumorais primárias e normais
+amostras_validas <- metadados$definition %in% c("Primary solid Tumor", "Solid Tissue Normal")
+
+# 2. Filtrar os metadados e a matriz bruta
+metadados_filtrados <- metadados[amostras_validas, ]
+matriz_raw_filtrada <- matriz_bruta[, amostras_validas]
+
+# 3. Converter para objeto DGEList (edgeR)
+dge <- DGEList(counts = matriz_raw_filtrada)
+grupos <- metadados_filtrados$definition
+
+# 4. Filtrar genes de baixa expressão com base no desenho experimental
+genes_a_manter <- filterByExpr(dge, group = grupos)
+dge_filtrado <- dge[genes_a_manter, , keep.lib.sizes = FALSE]
+
+# 5. Estimar fatores de normalização pelo método TMM
+dge_filtrado <- calcNormFactors(dge_filtrado, method = "TMM")
+
+# 6. Gerar matriz de Log-CPM para visualizações e guardar raw counts para DESeq2
+matriz_normalizada <- cpm(dge_filtrado, log = TRUE)
+matriz_raw_filtrada <- dge_filtrado$counts
+```
+
+## 4. Exploração Visual e Estatística Descritiva
+
+### 4.1 Sumarização clínica das amostras
+
+Realizou-se a sumarização clínica das amostras com base nos metadados previamente filtrados. O objetivo é caracterizar a composição do conjunto de dados que será utilizado nas análises seguintes, identificando a distribuição das amostras entre tecido tumoral primário e tecido normal, bem como algumas das suas principais características demográficas e clínicas.
+
+```{r}
+table(metadados_filtrados$definition)
+table(metadados_filtrados$gender)
+table(metadados_filtrados$ajcc_pathologic_stage)
+summary(metadados_filtrados$age_at_index)
+```
+ 
+*Interpretação*: O conjunto final incluiu 541 amostras tumorais e 72 amostras normais, evidenciando um desequilíbrio entre grupos. Relativamente ao sexo, observaram-se 405 amostras masculinas e 208 femininas. A distribuição por estádio patológico mostrou predominância de casos em Stage I, seguindo-se Stage III e Stage IV, embora parte das amostras não apresentasse informação de estádio disponível. Quanto à idade, a mediana foi de 61 anos e a média de 60.91 anos, com valores entre 26 e 89 anos.
+
+### 4.2 Visualização clínica por gráficos
+
+Procedemos à representação gráfica das principais variáveis clínicas das amostras filtradas, com o objetivo de facilitar a visualização da sua distribuição. Para isso, foram construídos gráficos relativos ao tipo de tecido, sexo, estádio patológico e idade, permitindo obter uma perspetiva visual da composição do conjunto de dados utilizado na análise.
+
+```{r}
+par(mfrow = c(2, 2)) # Layout para 4 gráficos
+
+# Gráfico da distribuição do tipo de amostra
+barplot(table(metadados_filtrados$definition),
+        las = 1, col = c("red", "steelblue"),
+        main = "Distribuição por Tipo de Tecido", ylab = "Número de amostras")
+
+# Gráfico da distribuição por sexo
+barplot(table(metadados_filtrados$gender),
+        las = 1, col = c("purple", "skyblue"),
+        main = "Distribuição por Sexo", ylab = "Número de amostras")
+
+# Gráfico da distribuição por estádio patológico
+barplot(table(metadados_filtrados$ajcc_pathologic_stage),
+        las = 2, cex.names = 0.7, col = "brown",
+        main = "Estádio Patológico (AJCC)", ylab = "Número de amostras")
+
+# Histograma das idades
+hist(metadados_filtrados$age_at_index,
+     breaks = 20, col = "lightgreen",
+     main = "Distribuição Etária", xlab = "Idade (anos)")
+
+par(mfrow = c(1, 1)) # Repor layout original
+```
+
+*Interpretação*: Os gráficos mostram uma predominância clara de amostras de tumor sólido primário relativamente ao tecido normal, bem como uma maior representação do sexo masculino. No que respeita ao estádio patológico, observa-se maior frequência de casos em Stage I, seguindo-se os estádios III, IV e II, enquanto os restantes têm expressão reduzida. A distribuição etária apresenta maior concentração entre os 50 e os 70 anos, com valores centrados em torno dos 60 anos.
+
+### 4.3 Exploração global da expressão de genes
+
+Neste tópico avaliou-se a distribuição global da expressão génica utilizando a matriz normalizada em log-CPM. Para esse efeito, foram construídos um boxplot por amostra, limitado a uma subamostra de 50 para facilitar a legibilidade, e um histograma com todos os valores de expressão. O objetivo foi verificar a comparabilidade global entre amostras e observar a forma geral da distribuição dos valores de expressão após a normalização.
+
+```{r}
+# Boxplot global por amostra (limitado às primeiras 50 amostras para legibilidade)
+boxplot(matriz_normalizada[,1:50],
+        outline = FALSE, xaxt = "n",
+        col = ifelse(metadados_filtrados$definition[1:50] == "Primary solid Tumor", "red", "steelblue"),
+        main = "Distribuição Global da Expressão (Subamostra de 50)", ylab = "log-CPM")
+
+legend("topright", legend = c("Tumor", "Normal"), fill = c("red", "steelblue"), bty = "n")
+
+# Histograma global dos valores de expressão
+hist(as.numeric(matriz_normalizada),
+     breaks = 100, col = "gray",
+     main = "Distribuição Global da Expressão de Genes", xlab = "log-CPM")
+```
+
+*Interpretação*: O boxplot mostra distribuições globalmente semelhantes entre as amostras representadas, com medianas próximas e dispersões comparáveis, o que sugere boa consistência entre bibliotecas após a normalização e ausência de outliers evidentes nesta subamostra. O histograma revela uma forte concentração de valores baixos de expressão, acompanhada por outras zonas de maior densidade em níveis intermédios e mais elevados, refletindo a coexistência de genes pouco expressos e genes com expressão mais marcada. No conjunto, os resultados indicam que os dados normalizados apresentam um comportamento global coerente e adequado para prosseguir com a exploração e análise estatística.
+
+## 5. Análise de genes de interesse biológico
+
+Identificou-se genes de interesse biológico como o VHL e PTEN na anotação do dataset, com o objetivo de os localizar corretamente antes da análise individual da sua expressão. A escolha destes dois genes justifica-se pela sua relevância no carcinoma de células renais claras. O VHL é um dos genes mais centrais nesta doença, estando o ccRCC fortemente associado a alterações neste locus, incluindo perda do braço curto do cromossoma 3 e silenciamento epigenético em parte dos tumores. Já o PTEN destaca-se pela sua associação à via PI(3)K/AKT/MTOR, também apontada no estudo original como relevante para a progressão tumoral e potencial interesse terapêutico. Assim, nesta etapa extraiu-se a informação de anotação dos genes e procuraram-se os identificadores Ensembl correspondentes a VHL e PTEN, de forma a permitir a sua análise específica nas etapas seguintes (The Cancer Genome Atlas Research Network (2013).
+
+```{r}
+# Extrair informação de anotação dos genes
+genes_info <- as.data.frame(rowData(dados_kirc))
+genes_info$ensembl_id <- rownames(genes_info)
+
+# Mapear e isolar os IDs Ensembl correspondentes a VHL e PTEN
+id_vhl <- rownames(genes_info)[genes_info$gene_name == "VHL"]
+id_pten <- rownames(genes_info)[genes_info$gene_name == "PTEN"]
+
+print(paste("ID do VHL mapeado:", id_vhl))
+print(paste("ID do PTEN mapeado:", id_pten))
+```
+
+### 5.1 Análise univariada (Teste de Wilcoxon)
+
+Procedemos à comparação das medianas de expressão (log-CPM) entre os grupos tumoral e normal, utilizando o teste não-paramétrico de Wilcoxon. Análise univariada (Teste de Wilcoxon)
+
+```{r}
+# Preparação e Teste para o gene VHL
+
+expr_vhl <- matriz_normalizada[id_vhl, ]
+dados_vhl <- data.frame(expressao = as.numeric(expr_vhl), grupo = metadados_filtrados$definition)
+
+boxplot(expressao ~ grupo, data = dados_vhl,
+        col = c("red", "steelblue"),
+        main = "Expressão do Gene VHL", ylab = "Expressão (log-CPM)", xlab = "Condição Clínica")
+
+wilcox.test(expressao ~ grupo, data = dados_vhl)
+```
+
+*Interpretação*: A expressão do gene VHL é globalmente mais baixa nas amostras tumorais do que no tecido normal, com uma mediana inferior no grupo Primary solid Tumor. Observa-se ainda maior variabilidade no grupo tumoral. Este resultado é compatível com o papel central do VHL no ccRCC.
+
+```{r}
+# Preparação e Teste para o gene PTEN
+expr_pten <- matriz_normalizada[id_pten, ]
+dados_pten <- data.frame(expressao = as.numeric(expr_pten), grupo = metadados_filtrados$definition)
+
+boxplot(expressao ~ grupo, data = dados_pten,
+        col = c("red", "steelblue"),
+        main = "Expressão do Gene PTEN", ylab = "Expressão (log-CPM)", xlab = "Condição Clínica")
+
+wilcox.test(expressao ~ grupo, data = dados_pten)
+```
+
+*Interpretação*: A expressão do gene PTEN apresenta valores muito semelhantes entre as amostras tumorais e normais, com medianas próximas nos dois grupos. Observa-se apenas uma ligeira maior variabilidade no grupo tumoral. Globalmente, o gráfico não sugere uma diferença visual marcada de expressão entre as duas condições.
+
+## 6. Análise de Expressão Diferencial (DESeq2)
+
+### 6.1 Identificação dos genes diferencialmente expressos
+
+O método DESeq2 utiliza um modelo estatístico baseado na distribuição binomial negativa, adequado para lidar com a variabilidade biológica inerente ao RNA-seq.
+
+```{r, message=FALSE, warning=FALSE}
+
+metadados_filtrados$definition <- factor(metadados_filtrados$definition)
+metadados_filtrados$definition <- relevel(metadados_filtrados$definition, ref = "Solid Tissue Normal")
+# Instanciar o modelo DESeq2 a partir da matriz filtrada de contagens brutas
+dds <- DESeqDataSetFromMatrix(
+  countData = matriz_raw_filtrada,
+  colData = metadados_filtrados,
+  design = ~ definition
+)
+
+# Estimação de dispersões e ajustamento do modelo
+dds <- DESeq(dds)
+
+# Extrair os resultados estatísticos do contraste Tumor vs. Normal
+res <- results(dds, contrast = c("definition", "Primary solid Tumor", "Solid Tissue Normal"))
+res <- res[order(res$padj), ] # Ordenar por p-value ajustado
+
+# Limpeza e anotação dos IDs (remoção de versões após o ponto)
+res_df <- as.data.frame(res)
+res_df$ensembl_id <- rownames(res_df)
+genes_info$ensembl_clean <- sub("\\..*", "", genes_info$ensembl_id)
+res_df$ensembl_clean <- sub("\\..*", "", res_df$ensembl_id)
+
+anotacao_limpa <- unique(genes_info[, c("ensembl_clean", "gene_name")])
+
+# Fundir os resultados com o mapeamento original de genes
+res_annot <- merge(res_df, anotacao_limpa, by = "ensembl_clean", all.x = TRUE)
+
+# Definir os limiares de significância (|log2FC| > 1 e p-value ajustado < 0.05)
+res_annot$significativo <- "Nao significativo"
+res_annot$significativo[!is.na(res_annot$padj) & res_annot$padj < 0.05 & abs(res_annot$log2FoldChange) > 1] <- "Significativo"
+
+# Mostrar as primeiras linhas dos genes mais significativos
+head(res_annot[order(res_annot$padj), ])
+
+# Contagem de DEGs encontrados
+table(res_annot$significativo)
+```
+
+*Interpretação*: Foram identificados 10.310 genes significativamente alterados no tumor (usando como critérios $|\log_2 FC| > 1$ e $p_{adj} < 0.05$).
+
+### 6.2 Visualização global da significância e magnitude (Volcano Plot)
+
+O Volcano Plot permite contrastar visualmente o fold-change (eixo X) com a robustez estatística (eixo Y) das alterações de expressão.
+
+```{r}
+ggplot(res_annot, aes(x = log2FoldChange, y = -log10(padj), color = significativo)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("gray", "red")) +
+  theme_minimal() +
+  labs(
+    title = "Volcano Plot - Tumor Sólido vs. Tecido Normal",
+    x = "Log2 Fold Change (Magnitude)",
+    y = "-Log10 Padj (Significância)"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+### 6.3 Padrões de expressão e separação entre grupos (Heatmap)
+
+Extraímos os 50 genes (DEGs) mais significativos do modelo estatístico e avaliamos os seus padrões numa escala de cores. O objetivo é verificar se este top 50 é suficiente para criar aglomerados (clusters) que separem perfeitamente pacientes saudáveis dos pacientes com tumor.
+
+```{r}
+# Selecionar top 50 DEGs (IDs limpos, sem versão)
+top50_clean <- head(res_annot$ensembl_clean[order(res_annot$padj)], 50)
+
+# Mapear IDs limpos para os originais com versão na matriz normalizada
+ids_matriz <- rownames(matriz_normalizada)
+ids_clean_matriz <- sub("\\..*", "", ids_matriz)
+top50_com_versao <- ids_matriz[ids_clean_matriz %in% top50_clean]
+
+# Subconjunto da matriz log-CPM
+matriz_top50 <- matriz_normalizada[top50_com_versao, ]
+
+# Anotação das colunas (condição clínica)
+anot <- data.frame(Grupo = metadados_filtrados$definition)
+rownames(anot) <- colnames(matriz_top50)
+
+# Gerar o Heatmap
+pheatmap(matriz_top50,
+         scale = "row",
+         annotation_col = anot,
+         show_rownames = TRUE,      
+         show_colnames = FALSE,     
+         fontsize_row = 7,          
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         main = "Top 50 DEGs - Diferenciação Transcriptómica")
+```
+
+*Interpretação*: O heatmap evidencia um conjunto de 50 genes diferencialmente expressos que distinguem de forma clara o tecido tumoral do tecido normal, pela criação de dois clusters primários bem definidos que refletem padrões transcriptómicos marcadamente distintos entre ambas as condições.
+
+## 7. Análise de Enriquecimento Funcional (Gene Ontology)
+
+Na etapa final da Fase 1, aplicamos uma análise de enriquecimento para mapear os genes significativos em vias e processos biológicos (Biological Processes) conhecidos. Para uma melhor interpretação biológica, dividimos a análise em vias sobrexpressas (ativadas pelo tumor) e subexpressas (reprimidas pelo tumor).
+
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+
+# Separar os genes sobrexpressos (Up) e subexpressos (Down)
+genes_up <- res_annot$ensembl_clean[res_annot$significativo == "Significativo" & res_annot$log2FoldChange > 1]
+genes_down <- res_annot$ensembl_clean[res_annot$significativo == "Significativo" & res_annot$log2FoldChange < -1]
+
+# Enriquecimento para Genes Sobrexpressos (Up-regulated)
+ego_up <- enrichGO(gene          = genes_up,
+                   OrgDb         = org.Hs.eg.db,
+                   keyType       = 'ENSEMBL',
+                   ont           = "BP", 
+                   pAdjustMethod = "BH",
+                   pvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+# Enriquecimento para Genes Subexpressos (Down-regulated)
+ego_down <- enrichGO(gene          = genes_down,
+                     OrgDb         = org.Hs.eg.db,
+                     keyType       = 'ENSEMBL',
+                     ont           = "BP", 
+                     pAdjustMethod = "BH",
+                     pvalueCutoff  = 0.05,
+                     readable      = TRUE)
+
+# Visualização: Dotplot dos Sobrexpressos
+plot_up <- enrichplot::dotplot(ego_up, showCategory=12) + 
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 45)) + 
+  theme_bw() + 
+  labs(title = "Processos Biológicos Sobrexpressos (Ativados no Tumor)",
+       subtitle = "Gene Ontology - Up-regulated Genes")
+
+# Visualização: Dotplot dos Subexpressos
+plot_down <- enrichplot::dotplot(ego_down, showCategory=12) + 
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 45)) + 
+  theme_bw() + 
+  labs(title = "Processos Biológicos Subexpressos (Reprimidos no Tumor)",
+       subtitle = "Gene Ontology - Down-regulated Genes")
+
+# Imprimir os gráficos
+plot_up
+plot_down
+```
+
+*Interpretação*: Relativamente ao dotplot dos genes sobrexpressos, verifica-se que os processos biológicos mais afetados estão quase exclusivamente ligados à proliferação, ativação e diferenciação de células do sistema imunitário (leucócitos, linfócitos, células T e B). Este resultado vai diretamente ao encontro do descrito na literatura para esta patologia, uma vez que o ccRCC está associado ao recrutamento de uma forte resposta inflamatória, caracterizada pela infiltração massiva de células imunitárias, incluindo células T, células B e células natural killer, para o microambiente tumoral (Monjaras-Avila et al., 2023). Tal fenómeno consegue explicar a presença de elevadas expressão de genes relacionados com o sistema imunitário.
+
+Por outro lado, a análise dos genes subexpressos ilustra as consequências da progressão tumoral no tecido de origem. Os processos mais significativamente reprimidos envolvem o desenvolvimento do sistema renal e do nefrónio, o transporte transmembranar de iões (como o sódio) e o catabolismo de ácidos orgânicos e de pequenas moléculas. Em conjunto, estes dados demonstram que as células tumorais sofrem uma profunda desdiferenciação, perdendo a sua identidade celular especializada e abandonando as funções fisiológicas normais de filtração e regulação metabólica típicas de células de um rim saudável. Este processo de perda de identidade funcional é uma característica central do ccRCC (Kim & Rossi, 2008).
+
+## 8. Análise de Vias Metabólicas e de Sinalização (KEGG)
+
+De modo a complementar a análise de processos biológicos e explorar a profunda alteração metabólica característica do ccRCC, realizou-se uma análise de enriquecimento recorrendo à base de dados KEGG (Kyoto Encyclopedia of Genes and Genomes).
+
+```{r, message=FALSE, warning=FALSE}
+
+# Primeiramente conversão dos identificadores Ensembl para Entrez ID.
+
+genes_up_entrez <- bitr(genes_up, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+genes_down_entrez <- bitr(genes_down, fromType = "ENSEMBL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Enriquecimento KEGG para Genes Sobrexpressos
+
+kegg_up <- enrichKEGG(gene         = genes_up_entrez$ENTREZID,
+                      organism     = 'hsa',
+                      pvalueCutoff = 0.05)
+
+# Enriquecimento KEGG para Genes Subexpressos
+
+kegg_down <- enrichKEGG(gene         = genes_down_entrez$ENTREZID,
+                        organism     = 'hsa',
+                        pvalueCutoff = 0.05)
+
+# Visualização KEGG: Sobrexpressos
+
+plot_kegg_up <- enrichplot::dotplot(kegg_up, showCategory=10) + 
+  theme_bw() + 
+  labs(title = "Vias KEGG Sobrexpressas (Ativadas no Tumor)",
+       subtitle = "KEGG Pathway Enrichment - Up-regulated Genes")
+
+# Visualização KEGG: Subexpressos
+
+plot_kegg_down <- enrichplot::dotplot(kegg_down, showCategory=10) + 
+  theme_bw() + 
+  labs(title = "Vias KEGG Subexpressas (Reprimidas no Tumor)",
+       subtitle = "KEGG Pathway Enrichment - Down-regulated Genes")
+
+# Imprimir os gráficos
+plot_kegg_up
+plot_kegg_down
+```
+
+*Interpretação*: Relativamente aos resultados da análise KEGG para os genes sobrexpressos, verifica-se que o perfil é esmagadoramente dominado por genes que estão integrados em vias de resposta imunitária e inflamatória, com especial destaque para os genes associados à via de interação citocina-recetor de citocina e às moléculas de adesão celular (CAMs). Este resultado vai diretamente ao encontro do descrito na literatura para esta patologia, evidenciando um ambiente de intensa comunicação intercelular, adesão e recrutamento ativo de leucócitos, que é essencial para a formação do complexo microambiente tumoral rico em células imunitárias típico do ccRCC (Monjaras-Avila et al., 2023). Tal fenómeno consegue também explicar a elevada expressão de genes mapeados pelo KEGG em vias tipicamente associadas a doenças autoimunes ou à rejeição de transplantes (Graft-versus-host disease e Allograft rejection), o que não reflete a presença clínica destas patologias, mas sim o estado de severa hiperativação imunitária desencadeada no tumor.
+
+Por outro lado, a análise dos genes subexpressos ilustra as consequências da profunda desregulação metabólica associada à progressão tumoral. A análise do KEGG indica que os genes mais significativamente reprimidos estão sobretudo integrados nas vias do metabolismo do carbono e no catabolismo de aminoácidos essenciais, uma observação para o ccRCC amplamente corroborada pela literatura (Wettersten et al., 2017; Xie et al., 2026). Verifica-se ainda uma inibição acentuada na expressão de genes pertencentes à via de sinalização PPAR. Como esta via participa na regulação da oxidação de ácidos gordos, a supressão destes genes promove a acumulação intracelular de lípidos e glicogénio uma acumulação típica do ccRCC (Wettersten et al., 2017; Li et al., 2026). Por último, é possível observar que os genes integrados em vias relacionadas com as funções fisiológicas e de regulação típicas de um rim saudável, como a secreção de ácido no túbulo coletor (Qu et al., 2022), também se encontram marcadamente subexpressos nos tecidos tumorais.
+
+# Fase 2: Redução de Dimensionalidade e Análise Não Supervisionada
+
+## 9. Redução de Dimensionalidade (PCA, UMAP e t-SNE)
+
+Para garantir consistência metodológica e otimização computacional, as três técnicas de redução de dimensionalidade foram aplicadas ao mesmo subconjunto de dados: os 1000 genes com maior variância ao longo de todas as amostras.
+
+```{r}
+# Calcular a variância de cada gene e selecionar os 1000 mais variáveis
+variancias <- apply(matriz_normalizada, 1, var)
+top_genes <- names(sort(variancias, decreasing = TRUE))[1:1000]
+
+# Submatriz reduzida para todas as análises desta secção
+matriz_dim_red <- matriz_normalizada[top_genes, ]
+
+# Definir cores padronizadas por grupo (Tumor = Red, Normal = Steelblue)
+cores_dim_red <- ifelse(metadados_filtrados$definition == "Primary solid Tumor", "red", "steelblue")
+### 9.1 Análise de Componentes Principais (PCA)
+```
+
+### 9.1 Análise de Componentes Principais (PCA)
+
+```{r}
+# Calcular PCA (amostras nas linhas, genes nas colunas)
+pca <- prcomp(t(matriz_dim_red), scale. = TRUE)
+
+# Calcular percentagem de variância explicada
+variancia_explicada <- (pca$sdev^2) / sum(pca$sdev^2)
+pc1_var <- round(100 * variancia_explicada[1], 2)
+pc2_var <- round(100 * variancia_explicada[2], 2)
+
+# Gráfico PCA
+plot(pca$x[,1], pca$x[,2],
+     col = cores_dim_red,
+     pch = 16,
+     xlab = paste0("PC1 (", pc1_var, "%)"),
+     ylab = paste0("PC2 (", pc2_var, "%)"),
+     main = "PCA das amostras: Tumor vs Normal")
+
+legend("topright",
+       legend = c("Tumor", "Normal"),
+       col = c("red", "steelblue"),
+       pch = 16,
+       bty = "n")
+```
+
+*Interpretação*: A análise de componentes principais (PCA) foi aplicada para explorar a estrutura global dos dados de expressão génica. O primeiro componente principal (PC1) explica 25.35% da variância total, enquanto o segundo (PC2) explica 11.2%, perfazendo um total de aproximadamente 36.5% da variância capturada nos dois primeiros eixos.
+
+O gráfico revela uma separação clara entre as amostras tumorais (vermelho) e as amostras normais (azul) ao longo do PC1, sugerindo que o perfil transcriptómico distingue eficazmente os dois grupos. As amostras normais encontram-se agrupadas formando um cluster compacto e homogéneo, o que indica baixa variabilidade interna neste grupo. As amostras tumorais distribuem-se numa região muito mais ampla, refletindo a maior heterogeneidade transcriptómica característica do tecido tumoral. Observa-se ainda um pequeno subgrupo de amostras tumorais na região intermédia que se sobrepõe parcialmente com as amostras normais, podendo representar amostras com perfil de expressão mais próximo do tecido saudável.
+
+### 9.2 Análise UMAP
+
+```{r}
+set.seed(42)
+umap_res <- umap(t(matriz_dim_red))
+
+df_umap <- data.frame(UMAP1 = umap_res$layout[,1],
+                      UMAP2 = umap_res$layout[,2],
+                      group = metadados_filtrados$definition)
+
+ggplot(df_umap, aes(UMAP1, UMAP2, color = group)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Primary solid Tumor" = "red", 
+                                "Solid Tissue Normal" = "steelblue")) +
+  labs(title = "UMAP das amostras: Tumor vs Normal", color = "Grupo") +
+  theme_classic()
+```
+
+*Interpretação*: A análise UMAP (Uniform Manifold Approximation and Projection) foi aplicada para explorar uma possível estrutura não-linear dos dados. O gráfico revela uma separação drástica entre as amostras de tecido normal (azul) e as tumorais (vermelho), confirmando a distinção primária evidenciada no PCA.
+
+Ao contrário do tecido normal, que forma um aglomerado único e denso no topo do gráfico, as amostras tumorais não formam apenas um cluster homogéneo. Observa-se claramente a divisão das amostras de tumor em pelo menos dois sub-clusters principais (um grande agregado à esquerda e um agregado secundário bem distinto no quadrante inferior direito). Esta topografia sugere fortemente a existência de subtipos moleculares distintos dentro do grupo tumoral. Destaca-se ainda a presença de uma amostra normal (azul) isolada e completamente imersa no grande cluster tumoral, o que pode dever-se a erro de anotação clínica original, contaminação da amostra ou até a um perfil de expressão incomum.
+
+### 9.3 Análise t-SNE
+
+```{r, results='hide', message=FALSE}
+set.seed(42)
+tsne_res <- Rtsne(t(matriz_dim_red), perplexity = 30, verbose = TRUE)
+
+df_tsne <- data.frame(tSNE1 = tsne_res$Y[,1],
+                      tSNE2 = tsne_res$Y[,2],
+                      group = metadados_filtrados$definition)
+
+ggplot(df_tsne, aes(tSNE1, tSNE2, color = group)) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Primary solid Tumor" = "red", 
+                                "Solid Tissue Normal" = "steelblue")) +
+  labs(title = "t-SNE das amostras: Tumor vs Normal", color = "Group") +
+  theme_classic()
+```
+
+*Interpretação*: A análise t-SNE (t-distributed Stochastic Neighbor Embedding) foi aplicada para avaliar e validar a vizinhança local dos perfis transcricionais.
+
+O gráfico consolida definitivamente a separação entre as amostras de tecido normal (azul) e as amostras tumorais (vermelho). Em concordância com o UMAP, as amostras tumorais formam agregados mais dispersos e fraturados, refletindo a elevada heterogeneidade transcriptómica característica do ccRCC. Tal como observado no algoritmo anterior, a possível amostra anómala de tecido normal volta a ser projetada no interior do agrupamento tumoral, reforçando a probabilidade de se tratar de um erro de etiquetagem na base de dados ou de uma verdadeira alteração fenotípica.
+
+No geral, a concordância dos três métodos atesta não só que a variância biológica ditada pelo estado da doença é a variável dominante, mas também que existe uma subestrutura complexa dentro do próprio tumor que merece exploração através de algoritmos de clustering não supervisionado.
+
+## 10. Clustering de Amostras e Associação Clínica
+
+Nesta seção, o foco incide na identificação de padrões naturais de similaridade transcriptómica através de algoritmos de clustering, cruzando os resultados com a informação clínica disponível.
+
+### 10.1 Preparação da Matriz
+
+Para garantir a coerência metodológica com as análises anteriores, utilizou-se o mesmo subconjunto dos 1000 genes mais variáveis.
+
+```{r}
+# Transpor a matriz já filtrada (amostras nas linhas, genes nas colunas) para os algoritmos
+matriz_amostras <- t(matriz_dim_red)
+```
+
+### 10.2 Clustering Hierárquico das Amostras
+
+Aplicamos clustering hierárquico com base na distância Euclidiana (adequada para dados contínuos em log-CPM) e no método de Ward, que minimiza a variância intra-cluster para gerar grupos mais coesos.
+
+```{r}
+# Calcula distâncias e aplica clustering
+distancias_amostras <- dist(matriz_amostras, method = "euclidean")
+hc_amostras <- hclust(distancias_amostras, method = "ward.D2")
+
+# Visualiza o dendrograma
+plot(hc_amostras, labels = FALSE, hang = -1,
+     main = "Clustering Hierárquico de Amostras (Top 1000 Genes mais Variáveis)",
+     xlab = "Amostras", ylab = "Distância (Ward)", sub = "")
+
+# Adiciona retângulos hipotéticos para os 2 grandes grupos primários
+rect.hclust(hc_amostras, k = 2, border = c("red", "steelblue"))
+```
+
+*Interpretação*: O dendrograma demonstra uma separação primária marcante em dois grandes ramos principais. Considerando a composição do dataset, esta divisão reflete o contraste entre as amostras tumorais e o tecido normal adjacente. Esta acentuada dicotomia é biologicamente sustentada pelo artigo do qual se obteve o dataset (The Cancer Genome Atlas Research Network, 2013), que descreve o ccRCC como sendo impulsionado por alterações genómicas severas logo em fases precoces. A perda do braço curto do cromossoma 3 (3p) ocorre em cerca de 91% dos casos de ccRCC, alterando radicalmente a paisagem transcriptómica global devido ao impacto no gene VHL e em genes remodeladores da cromatina.
+
+### 10.3 Algoritmos de Partição (K-Means)
+
+Em seguida, procurou-se testar a capacidade do algoritmo em discriminar as amostras sem conhecimento prévio definindo $k=2$.
+
+```{r}
+set.seed(42) 
+kmeans_todas <- kmeans(matriz_amostras, centers = 2, nstart = 25)
+
+# Tabela de contingência para verificar a pureza
+table(Cluster = kmeans_todas$cluster, Condicao = metadados_filtrados$definition)
+
+# Visualização
+fviz_cluster(kmeans_todas, data = matriz_amostras,
+             geom = "point", ellipse.type = "convex",
+             palette = c("red", "steelblue"),
+             ggtheme = theme_minimal(),
+             main = "K-Means (k=2): Prova de Separação")
+```
+
+*Interpretação*: A análise não supervisionada com duas partições (k=2) demonstra que o algoritmo conseguiu agrupar as amostras refletindo a sua condição clínica com uma precisão notável, provando que a alteração transcriptómica induzida pelo carcinoma é robusta o suficiente para ser detetada sem fornecer qualquer anotação prévia ao modelo.
+
+A análise da tabela de contingência revela uma separação clara:
+
+O Cluster 1 é dominado pelo tecido tumoral (513 amostras tumorais contra apenas 1 normal), evidenciando o perfil transcriptómico principal e característico da doença.
+
+O Cluster 2 conseguiu agrupar quase a totalidade das amostras de tecido normal (71 das 72 disponíveis).
+
+Do ponto de vista biológico e clínico, o facto de 28 amostras de tumor sólido primário terem sido agrupadas no Cluster 2 (junto do tecido normal) é relevante. Visualmente, no gráfico de dispersão, estas amostras localizam-se na região sobreposta à esquerda. Isto sugere que estes tumores específicos possuem um perfil molecular menos desdiferenciado, mantendo características transcricionais ainda muito semelhantes às do rim saudável. Este fenómeno pode justificar-se por se tratarem de tumores num estádio muito precoce, por terem uma menor agressividade intrínseca, ou devido a uma elevada percentagem de células normais infiltradas na amostra biopsiada.
+
+### 10.4 Exploração da Heterogeneidade Intra-tumoral (K-Means k=3)
+
+As projeções UMAP e t-SNE sugeriram a existência de pelo menos dois grandes subgrupos dentro das amostras tumorais. Para validar analiticamente esta observação visual, aplicámos novamente o algoritmo K-Means, mas desta vez forçando a divisão em três partições ($k=3$). O objetivo é verificar se o algoritmo isola o tecido normal num cluster e divide o tecido tumoral em dois clusters distintos, refletindo a topografia observada anteriormente.
+
+```{r}
+set.seed(42) 
+kmeans_subtipos <- kmeans(matriz_amostras, centers = 3, nstart = 25)
+
+# Tabela de contingência para cruzar os 3 clusters com a anotação clínica
+table(Cluster = kmeans_subtipos$cluster, Condicao = metadados_filtrados$definition)
+
+# Visualização da nova partição
+fviz_cluster(kmeans_subtipos, data = matriz_amostras,
+             geom = "point", ellipse.type = "convex",
+             palette = c("steelblue","darkorange","red"),
+             ggtheme = theme_minimal(),
+             main = "K-Means (k=3): Identificação de Subtipos Tumorais")
+```
+
+Interpretação: Os resultados confirmam a distinção primária entre tecido saudável e neoplásico, mas, de forma ainda mais relevante, sugerem uma divisão estrutural dentro do próprio grupo tumoral. A análise aos grupos formados pelo algoritmo K-Means permite destacar três clusters com potencial significado biológico.
+
+Em primeiro lugar, observa-se que o Cluster 1 agrupou 71 das 72 amostras de tecido normal, juntamente com as mesmas 28 amostras de tumor primário já identificadas na análise anterior (k=2). Este agrupamento reflete um perfil transcriptómico característico do tecido não neoplásico. A estabilidade deste cluster confirma a robustez do perfil destas 28 amostras tumorais nele integradas, cuja justificação biológica foi explorada na secção prévia.
+
+Em contrapartida, ao forçar a divisão em três partições, os Clusters 2 e 3 fragmentaram o grande bloco tumoral em dois subgrupos distintos. O Cluster 2 capturou 229 tumores, enquanto o Cluster 3 agrupou as restantes 284 amostras tumorais. Embora o K-Means imponha a criação de partições por definição, esta topografia alinha-se com a separação visual previamente sugerida pelo UMAP e t-SNE. Assim, esta distribuição suporta a hipótese de que a progressão do ccRCC não segue uma trajetória transcricional única, o que está em concordância com a literatura que indica a presença de diferentes subtipos moleculares nesta patologia (The Cancer Genome Atlas Research Network, 2013).
+
+## 11. Clustering de Genes e Padrões de Co-expressão
+
+### 11.1 Seleção dos genes mais variáveis
+
+Para a análise de clustering de genes, selecionaram-se os 500 genes com maior variância na matriz normalizada, de forma a privilegiar os perfis mais informativos e reduzir o contributo de genes com pouca variabilidade global. De seguida, os valores de expressão foram escalados por gene, permitindo comparar padrões relativos de expressão entre amostras e facilitando a identificação de módulos de co-expressão.
+
+```{r}
+# Seleção dos genes mais variáveis para clustering de genes
+variancias <- apply(matriz_normalizada, 1, var)
+top_genes <- names(sort(variancias, decreasing = TRUE))[1:500]
+
+# Construção da matriz de expressão para os genes selecionados
+matriz_top <- matriz_normalizada[top_genes, ]
+
+# Escalonamento por gene para comparação de padrões relativos
+matriz_top_z <- t(scale(t(matriz_top)))
+matriz_top_z <- matriz_top_z[complete.cases(matriz_top_z), ]
+```
+
+### 11.2 Heatmap dos genes mais variáveis
+
+Para explorar a organização global dos perfis de expressão, construiu-se um heatmap com os 500 genes mais variáveis. O clustering hierárquico aplicado simultaneamente aos genes e às amostras permitiu observar padrões globais de co-expressão e avaliar se o estado tumoral constituía uma das principais fontes de variabilidade transcriptómica.
+
+```{r}
+anot_col <- data.frame(
+  definition = metadados_filtrados$definition
+)
+rownames(anot_col) <- colnames(matriz_top_z)
+
+pheatmap(
+  matriz_top_z,
+  scale = "none",
+  annotation_col = anot_col,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  clustering_method = "complete"
+)
+```
+
+*Interpretação*: O heatmap revelou uma separação clara entre a maioria das amostras tumorais e as amostras de tecido normal, indicando que o estado tumoral constitui uma das principais fontes de variabilidade transcriptómica neste conjunto de dados. Para além disso, observaram-se blocos de genes com padrões de expressão coordenados, sugerindo a existência de grupos de genes potencialmente co-expressos. Estes resultados apontam para uma reorganização global da expressão génica no ccRCC, compatível com ativação e repressão coordenada de programas biológicos distintos.
+
+
+### 11.3 Clustering hierárquico dos genes
+
+Com o objetivo de identificar grupos de genes com perfis de expressão semelhantes ao longo das amostras, calculou-se a distância entre genes e realizou-se clustering hierárquico utilizando distância Euclidiana e método de ligação completa. O dendrograma obtido permite visualizar a estrutura hierárquica de semelhança entre os genes e constitui a base para a definição de módulos de co-expressão.
+
+```{r}
+gene_dist <- dist(matriz_top_z, method = "euclidean")
+gene_hclust <- hclust(gene_dist, method = "complete")
+
+plot(gene_hclust, labels = FALSE, main = "Dendrograma dos genes")
+```
+*Interpretação*: O dendrograma revelou uma estrutura hierárquica bem definida entre os genes mais variáveis, sugerindo a existência de grupos de genes com perfis de expressão semelhantes ao longo das amostras. Este resultado indica que os genes não se distribuem de forma aleatória, mas antes apresentam padrões organizados de co-expressão, consistentes com a presença de programas transcriptómicos distintos no conjunto de dados.
+
+### 11.4 Definição dos módulos de co-expressão
+
+Para facilitar a interpretação biológica dos padrões observados, o dendrograma foi cortado em quatro módulos de co-expressão. Optou-se por esta divisão por permitir uma estrutura suficientemente interpretável, evitando simultaneamente uma fragmentação excessiva dos clusters. De seguida, cada gene foi associado ao respetivo módulo e anotado com o seu identificador Ensembl e nome génico.
+
+```{r}
+modulos <- cutree(gene_hclust, k = 4)
+table(modulos)
+
+genes_modulos <- data.frame(
+  ensembl_id = names(modulos),
+  modulo = modulos
+)
+
+genes_modulos <- merge(
+  genes_modulos,
+  genes_info[, c("ensembl_id", "gene_name")],
+  by = "ensembl_id",
+  all.x = TRUE
+)
+
+genes_modulos <- genes_modulos[, c("ensembl_id", "gene_name", "modulo")]
+```
+*Interpretação*: O corte do dendrograma em quatro grupos permitiu identificar quatro módulos de co-expressão com dimensões distintas, nomeadamente 203, 71, 115 e 111 genes. Esta distribuição mostra que a estrutura de co-expressão não é uniforme, existindo um módulo dominante e três módulos de dimensão intermédia.
+
+### 11.5 Visualização dos módulos de co-expressão
+
+Para representar visualmente os módulos obtidos, construiu-se um novo heatmap com anotação simultânea das amostras e dos módulos de genes. Esta abordagem permite observar de forma integrada a relação entre os grupos de genes co-expressos e o contraste entre tecido tumoral e tecido normal.
+
+```{r}
+annot_row <- data.frame(
+  modulo = as.factor(modulos)
+)
+rownames(annot_row) <- names(modulos)
+
+annot_col <- data.frame(
+  definition = metadados_filtrados$definition
+)
+rownames(annot_col) <- colnames(matriz_top_z)
+
+pheatmap(
+  matriz_top_z,
+  scale = "none",
+  annotation_col = annot_col,
+  annotation_row = annot_row,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  clustering_method = "complete"
+)
+```
+*Interpretação*: O heatmap anotado com os módulos de co-expressão mostrou que os 500 genes mais variáveis podem ser organizados em quatro clusters formais, cada um correspondendo a um subconjunto de genes com perfis de expressão semelhantes ao longo das amostras. Visualmente, observa-se que a maioria das amostras tumorais se concentra num grande bloco principal, enquanto as amostras normais tendem a agrupar-se num ramo mais restrito, localizado sobretudo na extremidade direita do dendrograma das colunas. Neste subconjunto de amostras normais, vários blocos de genes apresentam padrões contrastantes, com alguns módulos a revelar expressão relativamente mais elevada e outros expressão mais reduzida face às amostras tumorais. Este comportamento reforça a existência de programas de co-expressão distintos e sugere que a separação entre tecido tumoral e tecido normal não depende apenas de genes isolados, mas de alterações coordenadas em conjuntos específicos de genes.
+
+### 11.6 Padrão médio de expressão dos módulos
+
+Para resumir o comportamento global dos módulos de co-expressão, calculou-se a média dos valores de expressão escalados para todos os genes pertencentes a cada módulo. Esta abordagem permite observar, de forma mais clara, como cada módulo se comporta ao longo das amostras e identificar quais os módulos mais associados ao tecido tumoral ou ao tecido normal.
+
+```{r}
+modulo_medio <- sapply(sort(unique(modulos)), function(m) {
+  colMeans(matriz_top_z[modulos == m, , drop = FALSE], na.rm = TRUE)
+})
+
+modulo_medio <- t(modulo_medio)
+rownames(modulo_medio) <- paste0("Modulo_", sort(unique(modulos)))
+
+pheatmap(
+  modulo_medio,
+  annotation_col = anot_col,
+  show_colnames = FALSE,
+  main = "Padrão médio de expressão dos módulos"
+)
+```
+
+*Interpretação*: O heatmap do padrão médio de expressão dos módulos mostrou que os quatro clusters de genes apresentam comportamentos distintos ao longo das amostras. Em particular, o Módulo 1 destacou-se por apresentar valores mais elevados no subconjunto de amostras normais agrupadas no ramo da direita do dendrograma, sugerindo associação a um perfil mais próximo do tecido renal normal. Em contraste, os módulos 3 e 4 apresentaram, de forma global, valores relativamente mais elevados em grande parte das amostras tumorais, sendo o sinal do Módulo 4 particularmente evidente num subgrupo tumoral intermédio. O Módulo 2 apresentou um comportamento mais heterogéneo, sem um contraste tão marcado entre as duas condições. Estes resultados sugerem que os módulos identificados correspondem a programas de co-expressão distintos, alguns mais associados ao tecido normal e outros mais relacionados com o fenótipo tumoral.
+
+### 11.7 Associação dos módulos ao tecido tumoral e ao tecido normal
+
+Para quantificar a associação de cada módulo ao tecido tumoral ou ao tecido normal, calculou-se a média do padrão de expressão de cada módulo separadamente nos dois grupos de amostras. A diferença entre as médias permitiu identificar os módulos mais característicos de cada condição biológica.
+
+```{r}
+grupo_amostra <- anot_col$definition
+names(grupo_amostra) <- rownames(anot_col)
+grupo_amostra <- grupo_amostra[colnames(matriz_top_z)]
+
+resumo_modulos <- do.call(rbind, lapply(sort(unique(modulos)), function(m) {
+  perfil_mod <- colMeans(matriz_top_z[modulos == m, , drop = FALSE], na.rm = TRUE)
+
+  data.frame(
+    modulo = m,
+    media_tumor = mean(perfil_mod[grupo_amostra == "Primary solid Tumor"], na.rm = TRUE),
+    media_normal = mean(perfil_mod[grupo_amostra == "Solid Tissue Normal"], na.rm = TRUE)
+  )
+}))
+
+resumo_modulos$diferenca_tumor_normal <- resumo_modulos$media_tumor - resumo_modulos$media_normal
+
+resumo_modulos
+```
+
+*Interpretação*: A análise quantitativa do padrão médio de expressão confirmou que os módulos 1 e 2 estão mais associados ao tecido normal, enquanto os módulos 3 e 4 apresentam maior associação ao tumor. O Módulo 1 destacou-se como o mais característico do tecido normal, apresentando uma média claramente mais elevada nas amostras normais (1.686) do que nas tumorais (-0.224), com uma diferença tumor-normal de -1.910. Em contraste, o Módulo 4 apresentou o padrão mais associado ao fenótipo tumoral, com média positiva nas amostras tumorais (0.084) e negativa nas amostras normais (-0.631), correspondendo a uma diferença de 0.715. O Módulo 2 mostrou também associação ao tecido normal, embora de forma menos marcada, enquanto o Módulo 3 apresentou uma associação tumoral intermédia. Estes resultados indicam que os quatro módulos obtidos por clustering hierárquico podem ser interpretados como subdivisões de dois grandes programas transcriptómicos: um mais relacionado com a manutenção de funções normais do tecido renal e outro mais associado à reprogramação génica observada no ccRCC.
+
+### 11.8 Relação entre os módulos de co-expressão e a expressão diferencial da Fase 1
+
+Para relacionar os módulos de co-expressão com os resultados obtidos na Fase 1, compararam-se os genes pertencentes aos módulos mais representativos com as listas de genes diferencialmente expressos. Em particular, procurou-se avaliar se o módulo mais associado ao tecido normal coincidia com genes subexpressos no tumor e se o módulo mais associado ao tumor coincidia com genes sobrexpressos.
+
+
+```{r}
+genes_modulo1 <- subset(genes_modulos, modulo == 1)
+genes_modulo4 <- subset(genes_modulos, modulo == 4)
+
+lista_modulo1 <- na.omit(genes_modulo1$gene_name)
+lista_modulo4 <- na.omit(genes_modulo4$gene_name)
+
+genes_up <- unique(na.omit(res_annot$gene_name[
+  res_annot$log2FoldChange > 1 & res_annot$padj < 0.05
+]))
+
+genes_down <- unique(na.omit(res_annot$gene_name[
+  res_annot$log2FoldChange < -1 & res_annot$padj < 0.05
+]))
+
+overlap_mod1_down <- intersect(lista_modulo1, genes_down)
+overlap_mod1_up   <- intersect(lista_modulo1, genes_up)
+
+overlap_mod4_up   <- intersect(lista_modulo4, genes_up)
+overlap_mod4_down <- intersect(lista_modulo4, genes_down)
+
+resumo_fase1_modulos <- data.frame(
+  modulo = c("Modulo_1", "Modulo_4"),
+  n_genes_modulo = c(length(lista_modulo1), length(lista_modulo4)),
+  n_overlap_up = c(length(overlap_mod1_up), length(overlap_mod4_up)),
+  n_overlap_down = c(length(overlap_mod1_down), length(overlap_mod4_down))
+)
+
+resumo_fase1_modulos
+```
+
+*Interpretação*: A comparação entre os módulos de co-expressão e os genes diferencialmente expressos da Fase 1 mostrou forte concordância entre ambas as abordagens. O Módulo 1, com 203 genes, apresentou sobreposição predominante com genes subexpressos no tumor (183 genes) e apenas 2 genes sobrexpressos, reforçando a sua associação a um perfil mais próximo do tecido renal normal. Em contraste, o Módulo 4, com 111 genes, apresentou 110 genes sobrexpressos no tumor e nenhuma sobreposição com genes subexpressos, confirmando a sua forte associação ao fenótipo tumoral. Estes resultados mostram que os módulos identificados por clustering não supervisionado são consistentes com os padrões previamente observados na análise diferencial supervisionada.
+
+### 11.9 Conexão conceptual com as vias KEGG da Fase 1
+
+Para completar a interpretação biológica dos módulos mais representativos, relacionaram-se os resultados obtidos por clustering de genes com as vias KEGG identificadas na Fase 1. Esta comparação permitiu verificar se os módulos mais associados ao tecido normal e ao tumor eram coerentes com os principais processos biológicos previamente enriquecidos.
+
+```{r}
+kegg_up_df <- as.data.frame(kegg_up)
+kegg_down_df <- as.data.frame(kegg_down)
+
+head(kegg_up_df[, c("ID", "Description", "GeneRatio", "p.adjust")], 10)
+head(kegg_down_df[, c("ID", "Description", "GeneRatio", "p.adjust")], 10)
+```
+
+*Interpretação*: A comparação entre os módulos de co-expressão e os resultados de enriquecimento KEGG da Fase 1 revelou uma forte coerência biológica entre as duas abordagens. O Módulo 1, mais associado ao tecido normal e com elevada sobreposição com genes subexpressos no tumor, relacionou-se com vias predominantemente metabólicas e fisiológicas, como metabolismo de aminoácidos, metabolismo do carbono, via PPAR, metabolismo do retinol e secreção ácida do ducto coletor. Este padrão sugere que o Módulo 1 representa um programa transcriptómico compatível com a manutenção da função renal normal.
+
+Em contraste, o Módulo 4, mais associado ao tumor e com sobreposição quase total com genes sobrexpressos no tumor, mostrou concordância com vias ligadas à interação citocina-recetor, moléculas de adesão celular, fagossoma e outros processos imunes e inflamatórios. No contexto tumoral, estas vias sugerem maior ativação de programas de comunicação celular, inflamação e interação com o microambiente.
+
+Em conjunto, estes resultados mostram que os módulos identificados por clustering de genes correspondem a programas biológicos coerentes com os resultados da Fase 1: o Módulo 1 reflete funções metabólicas e fisiológicas do tecido renal normal, enquanto o Módulo 4 está mais associado ao fenótipo tumoral.
+
+### 11.10 Genes de interesse e enquadramento biológico
+
+A análise dos genes representativos dos módulos mais contrastantes reforçou a distinção entre um programa associado ao tecido renal normal e um programa mais característico do fenótipo tumoral. No Módulo 1, identificado anteriormente como o mais associado às amostras normais, surgiram genes como DPEP1, SLC12A1 e SLC13A2, compatíveis com transporte tubular e homeostase renal. Este resultado é coerente com o perfil global do módulo, que apresentou expressão média mais elevada no tecido normal e forte sobreposição com genes subexpressos no tumor. Em particular, os transportadores da família SLC constituem uma componente importante da organização funcional do néfron, enquanto o DPEP1 apresenta relevância em contexto renal, reforçando a associação deste módulo à identidade funcional do tecido não tumoral (Lewis et al., 2021; Lau et al., 2022).
+
+Em contraste, no Módulo 4, mais associado às amostras tumorais, destacaram-se genes como CA9 e CCL20. O CA9 é reconhecido como um marcador relevante de ccRCC e está fortemente associado à resposta à hipóxia, enquanto o CCL20 é compatível com o perfil inflamatório e de interação com o microambiente tumoral observado nos resultados funcionais. Além disso, o eixo CCL20-CCR6 foi implicado na migração de células de carcinoma renal em interação com macrófagos associados ao tumor, o que reforça a interpretação deste módulo como um programa transcriptómico mais próximo do fenótipo tumoral (Deng et al., 2024; Kadomoto et al., 2020).
+
+Em conjunto, estes genes confirmam, também ao nível individual, o padrão já observado nos módulos de co-expressão, na expressão diferencial e na análise KEGG. Assim, o Módulo 1 mantém um perfil compatível com funções renais normais, enquanto o Módulo 4 concentra genes mais característicos da reprogramação transcriptómica tumoral.
+
+# Fase 3: Machine Learning
+
+## 12 Estruturação do Dataset
+
+### 12.1 Seleção de Genes e Preparação da Matriz de Entrada (Input)
+
+Usam-se os 1000 genes com maior variância, em coerência com as análises de redução de dimensionalidade da Fase 2 (PCA, UMAP, t-SNE). Esta escolha reduz a dimensionalidade de forma não supervisionada e evita overfitting ao fornecer ao modelo os genes mais informativos biologicamente.
+
+```{r}
+# 1000 genes mais variáveis
+variancias  <- apply(matriz_normalizada, 1, var)
+top1000_ids <- names(sort(variancias, decreasing = TRUE))[1:1000]
+
+# Matriz ML: amostras nas linhas, genes nas colunas
+ml_matrix <- t(matriz_normalizada[top1000_ids, ])
+
+# Variável resposta
+labels <- factor(
+  ifelse(metadados_filtrados$definition == "Primary solid Tumor", "Tumor", "Normal"),
+  levels = c("Normal", "Tumor")  # "Normal" = referência negativa
+)
+
+cat("=== Distribuição original das classes ===\n")
+print(table(labels))
+cat(sprintf("\nRácio de desequilíbrio: %.1f:1 (Tumor:Normal)\n",
+            sum(labels == "Tumor") / sum(labels == "Normal")))
+```
+
+### 12.3 Divisão Treino / Validação / Teste (60 / 20 / 20)
+
+A comparação imparcial dos três modelos do grupo (Random Forest, SVM e PLS) exige a avaliação num mesmo conjunto de teste, nunca exposto durante o treino ou otimização. A arquitetura de partição que se adotou é a seguinte:
+
+| Conjunto        | Proporção | Usado para                                              |
+|---              |---        |---                                                      |
+| **Treino**      | 60 %      | Aprendizagem do modelo                                  |
+| **Validação**   | 20 %      | Otimização de hiperparâmetros (mtry, C, λ)              |
+| **Teste**       | 20 %      | Avaliação final, tabela comparativa e curvas ROC        |
+
+A divisão processou-se de forma estratificada para manter o rácio Tumor/Normal inalterado nos três subconjuntos. A reprodutibilidade do split é garantida pelo uso da função estatística set.seed(42).
+
+```{r}
+set.seed(42)  # FIXO — não alterar
+
+# --- Passo 1: separar 80% (treino + val) dos 20% de teste ---
+idx_trainval    <- createDataPartition(labels, p = 0.80, list = FALSE)
+matrix_trainval <- ml_matrix[idx_trainval, ]
+labels_trainval <- labels[idx_trainval]
+test_matrix     <- ml_matrix[-idx_trainval, ]
+test_labels     <- labels[-idx_trainval]
+
+# --- Passo 2: dividir os 80% em 60% treino e 20% validação ---
+# 0.75 × 80% = 60% do total
+idx_train    <- createDataPartition(labels_trainval, p = 0.75, list = FALSE)
+train_matrix <- matrix_trainval[idx_train, ]
+train_labels <- labels_trainval[idx_train]
+val_matrix   <- matrix_trainval[-idx_train, ]
+val_labels   <- labels_trainval[-idx_train]
+
+cat("=== Conjunto de Treino (60%) ===\n");    print(table(train_labels))
+cat("\n=== Conjunto de Validação (20%) ===\n"); print(table(val_labels))
+cat("\n=== Conjunto de Teste (20%) ===\n");    print(table(test_labels))
+
+cat(sprintf(
+  "\nDimensões:\n  Treino    = %d amostras × %d genes
+  Validação = %d amostras × %d genes\n  Teste     = %d amostras × %d genes\n",
+  nrow(train_matrix), ncol(train_matrix),
+  nrow(val_matrix),   ncol(val_matrix),
+  nrow(test_matrix),  ncol(test_matrix)
+))
+```
+
+A divisão estratificada garantiu a preservação da proporção original das classes (~88% Tumor vs. ~12% Normal) nos três subconjuntos. O conjunto de teste permanecerá estritamente reservado e será utilizado exclusivamente na avaliação final. Ao ser partilhado e mantido idêntico para os três modelos preditivos do grupo, assegura-se que a elaboração da tabela comparativa e das curvas ROC seja rigorosa e isenta de enviesamentos.
+
+### 12.4 Tratamento do Desequilíbrio de Classes com SMOTE
+
+Com 541 amostras tumorais contra apenas 72 normais (rácio ≈ 7.5:1), um modelo preditivo sem tratamento prévio tenderia a desenvolver um enviesamento para a classe maioritária, classificando sistematicamente todas as instâncias como "Tumor" e atingindo uma exatidão ilusória de ~88%. Para mitigar este efeito, o SMOTE é aplicado estritamente após a partição dos dados e exclusivamente ao conjunto de treino, alicerçado em duas justificações metodológicas fundamentais:
+
+- Prevenção de data leakage (fuga de informação): O algoritmo SMOTE gera amostras sintéticas por interpolação no espaço dos vizinhos mais próximos. Se fosse aplicado antes da divisão, as amostras sintéticas geradas a partir de vizinhos alocados ao teste iriam contaminar o treino com informação indireta. Isto violaria a independência do teste e inflacionaria artificialmente as métricas de avaliação
+
+- Preservação do realismo clínico: Os conjuntos de validação e teste mantêm a distribuição natural de classes (~88% / 12%) para garantir que a avaliação das métricas reflita fielmente o desempenho esperado do modelo num contexto de diagnóstico clínico real.
+
+O conjunto de treino equilibrado resultante (train_matrix_sm / train_labels_sm) será partilhado e utilizado por todos os modelos que tencionamos explorar (Random Forest, SVM e PLS). Esta padronização garante que qualquer divergência no desempenho final se deve puramente à arquitetura do algoritmo, e não a diferenças na fase de treino.
+
+```{r}
+
+set.seed(42) # FIXO — não alterar
+
+smote_result <- smotefamily::SMOTE(
+  X        = as.data.frame(train_matrix),
+  target   = as.character(train_labels),
+  K        = 5,    # 5 vizinhos mais próximos
+  dup_size = 0     # oversampling automático até equilíbrio
+)
+
+# Extrair matriz e labels balanceadas
+train_matrix_sm <- as.matrix(smote_result$data[, -ncol(smote_result$data)])
+train_labels_sm <- factor(smote_result$data$class, levels = c("Normal", "Tumor"))
+
+cat("=== Distribuição após SMOTE (treino) ===\n")
+print(table(train_labels_sm))
+cat(sprintf("Total amostras de treino após SMOTE: %d\n", nrow(train_matrix_sm)))
+```
+
+Após o SMOTE, o conjunto de treino passou a ter uma distribuição mais equilibrada entre as classes.
+
+## 13. Modelo SVM Linear
+
+Aplicou-se um modelo SVM com kernel linear para classificar as amostras como Tumor ou Normal com base nos perfis de expressão dos 1000 genes previamente selecionados. Este modelo supervisionado procura encontrar uma fronteira de separação entre as duas classes, utilizando as classes reais das amostras durante o treino. A escolha de um kernel linear é adequada neste contexto, uma vez que os dados transcriptómicos apresentam elevada dimensionalidade e o modelo permite, adicionalmente, interpretar a contribuição de cada gene através dos pesos associados ao classificador.
+
+### 13.1 Preparação dos dados para o SVM
+
+Antes de treinar o modelo, foram preparados os conjuntos de treino, validação e teste para serem usados no SVM. O conjunto de treino corresponde aos dados após aplicação de SMOTE, enquanto os conjuntos de validação e teste mantêm a distribuição original das classes.
+
+```{r}
+# Preparação dos objetos específicos para o SVM
+
+x_train_svm <- as.data.frame(train_matrix_sm)
+y_train_svm <- train_labels_sm
+
+x_val_svm <- as.data.frame(val_matrix)
+y_val_svm <- val_labels
+
+x_test_svm <- as.data.frame(test_matrix)
+y_test_svm <- test_labels
+
+# Garantir que os níveis das classes são consistentes
+y_train_svm <- factor(y_train_svm, levels = c("Normal", "Tumor"))
+y_val_svm   <- factor(y_val_svm,   levels = c("Normal", "Tumor"))
+y_test_svm  <- factor(y_test_svm,  levels = c("Normal", "Tumor"))
+
+stopifnot(identical(colnames(x_train_svm), colnames(x_val_svm)))
+stopifnot(identical(colnames(x_train_svm), colnames(x_test_svm)))
+
+cat("=== Dados preparados para o SVM ===\n\n")
+
+cat("Treino após SMOTE:\n")
+print(table(y_train_svm))
+
+cat("\nValidação:\n")
+print(table(y_val_svm))
+
+cat("\nTeste:\n")
+print(table(y_test_svm))
+
+cat(sprintf(
+  "\nDimensões:\n  Treino    = %d amostras × %d genes\n  Validação = %d amostras × %d genes\n  Teste     = %d amostras × %d genes\n",
+  nrow(x_train_svm), ncol(x_train_svm),
+  nrow(x_val_svm),   ncol(x_val_svm),
+  nrow(x_test_svm),  ncol(x_test_svm)
+))
+```
+
+*Interpretação*: Os dados foram organizados de forma consistente para a aplicação do SVM linear, garantindo que os conjuntos de treino, validação e teste usam os mesmos 1000 genes e na mesma ordem. O conjunto de treino, após aplicação do SMOTE, ficou praticamente balanceado, com 308 amostras Normal e 325 amostras Tumor. Esta etapa permite reduzir o impacto do desequilíbrio entre classes durante o ajuste do modelo. Em contraste, os conjuntos de validação e teste mantiveram a distribuição original das classes, ambos com 14 amostras Normal e 108 amostras Tumor, permitindo avaliar o modelo em condições mais próximas da distribuição real do dataset. Assim, o modelo é treinado com menor enviesamento para a classe maioritária, mas validado e testado em dados que preservam o desequilíbrio original.
+
+### 13.2 Otimização do parâmetro C
+
+O parâmetro C do SVM controla o grau de penalização dos erros de classificação. Valores mais baixos permitem maior tolerância a erros, enquanto valores mais altos tornam o modelo mais rígido na separação das classes.
+
+```{r}
+set.seed(42)
+
+cost_values <- 2^seq(-5, 10, by = 1)
+
+svm_tuning <- e1071::tune(
+  METHOD = e1071::svm,
+  train.x = x_train_svm,
+  train.y = y_train_svm,
+  validation.x = x_val_svm,
+  validation.y = y_val_svm,
+  ranges = list(cost = cost_values),
+  kernel = "linear",
+  type = "C-classification",
+  probability = TRUE,
+  scale = TRUE,
+  tunecontrol = e1071::tune.control(sampling = "fix")
+)
+
+# 1. Extrair a tabela de performances
+resultados_limpos <- svm_tuning$performances
+
+# 2. Remover a coluna de dispersão (pois com validação fixa apenas gera NA)
+resultados_limpos$dispersion <- NULL
+
+# 3. Desligar a notação científica para facilitar a leitura (ex: 3.125e-02 passa a 0.03125)
+options(scipen = 999)
+
+# 4. Arredondar os valores para 5 casas decimais
+resultados_limpos$cost <- round(resultados_limpos$cost, 5)
+resultados_limpos$error <- round(resultados_limpos$error, 5)
+
+# 5. Imprimir uma tabela formatada visualmente
+print(knitr::kable(
+  resultados_limpos, 
+  col.names = c("Custo (C)", "Taxa de Erro"), 
+  align = "c",                               
+  caption = "Resultados da Afinação do Modelo SVM (Kernel Linear)"
+))
+
+# 6. Extrair e imprimir o melhor valor
+best_cost_svm <- svm_tuning$best.parameters$cost
+cat("\nMelhor valor de C:", best_cost_svm, "\n")
+```
+
+*Interpretação*: A otimização do parâmetro C foi realizada usando uma grelha de valores, com avaliação no conjunto de validação. O procedimento selecionou C = 0.03125, com erro de validação de aproximadamente 0.0082. No entanto, os resultados detalhados indicam que vários valores de C apresentaram o mesmo erro de validação, sugerindo que o desempenho do SVM linear foi pouco sensível à escolha deste parâmetro dentro da grelha testada.
+
+A escolha de um valor baixo de C implica uma penalização mais reduzida para erros de classificação, favorecendo uma margem de separação mais flexível. Esta opção é adequada neste contexto, uma vez que o treino foi realizado sobre dados balanceados por SMOTE, sendo importante evitar uma fronteira demasiado rígida ou excessivamente ajustada às amostras sintéticas. O baixo erro no conjunto de validação sugere que os perfis de expressão selecionados contêm informação discriminativa suficiente para separar amostras tumorais e normais de forma consistente, embora a avaliação final deva ser feita no conjunto de teste.
+
+### 13.3 Treino do modelo SVM final 
+
+Após a seleção do melhor valor do parâmetro C, foi treinado o modelo SVM linear final. O modelo foi ajustado utilizando o conjunto de treino equilibrado por SMOTE e o valor de C escolhido na etapa anterior.
+
+```{r}
+# Treino do modelo SVM linear final
+set.seed(42)
+
+svm_model_final <- e1071::svm(
+  x = x_train_svm,
+  y = y_train_svm,
+  kernel = "linear",
+  type = "C-classification",
+  cost = best_cost_svm,
+  probability = TRUE,
+  scale = TRUE
+)
+
+svm_model_final
+```
+
+*Interpretação*: O modelo SVM linear final foi treinado com o valor de C = 0.03125 selecionado na etapa de otimização. Este valor corresponde a uma regularização relativamente forte, favorecendo uma margem de separação mais flexível e reduzindo o risco de sobreajustamento ao conjunto de treino balanceado por SMOTE. A opção scale = TRUE garante que os genes são colocados numa escala comparável durante o ajuste do modelo, o que é importante para um SVM linear, uma vez que os pesos atribuídos às variáveis podem ser influenciados pela escala dos dados.
+
+O modelo final utilizou 20 vetores de suporte, ou seja, apenas uma parte reduzida das amostras de treino foi determinante para definir a fronteira de separação entre as classes. Este resultado sugere que, no espaço formado pelos 1000 genes selecionados, existe uma separação relativamente clara entre amostras tumorais e normais. No entanto, esta conclusão deve ser confirmada pela avaliação no conjunto de teste, que não foi utilizado durante o treino nem durante a otimização do parâmetro C.
+
+### 13.4 Avaliação do modelo no conjunto de teste
+
+O desempenho do modelo SVM linear final foi avaliado no conjunto de teste, que não foi utilizado durante o treino nem durante a otimização do parâmetro C. Esta etapa permite estimar a capacidade do modelo para classificar novas amostras como Tumor ou Normal.
+
+Foram calculadas as principais métricas de desempenho: Accuracy, Sensibilidade, Especificidade, Balanced Accuracy, Kappa e AUC. A classe Tumor foi considerada como classe positiva, uma vez que representa o principal grupo de interesse biológico neste trabalho.
+
+```{r}
+# Avaliação do modelo SVM linear no conjunto de teste
+
+svm_pred_test_raw <- predict(
+  svm_model_final,
+  newdata = x_test_svm,
+  probability = TRUE
+)
+
+# Guardar probabilidades antes de converter as previsões para factor
+svm_probabilities <- attr(svm_pred_test_raw, "probabilities")
+
+# Verificação de segurança: garantir que as probabilidades foram calculadas
+if (is.null(svm_probabilities)) {
+  stop("As probabilidades não foram calculadas. Confirma que o modelo SVM foi treinado com probability = TRUE.")
+}
+
+# Extrair a probabilidade da classe Tumor
+svm_prob_tumor <- svm_probabilities[, "Tumor"]
+
+# Converter previsões para factor com os mesmos níveis das classes reais
+svm_pred_test <- factor(
+  svm_pred_test_raw,
+  levels = c("Normal", "Tumor")
+)
+
+# Matriz de confusão
+svm_confusion <- caret::confusionMatrix(
+  data = svm_pred_test,
+  reference = y_test_svm,
+  positive = "Tumor"
+)
+
+cat("=== Matriz de confusão - SVM linear ===\n\n")
+print(svm_confusion)
+
+# Curva ROC e AUC
+svm_roc <- pROC::roc(
+  response = y_test_svm,
+  predictor = svm_prob_tumor,
+  levels = c("Normal", "Tumor"),
+  direction = "<",
+  quiet = TRUE
+)
+
+svm_auc <- as.numeric(pROC::auc(svm_roc))
+
+# Métricas finais do SVM
+svm_metrics <- data.frame(
+  Modelo = "SVM Linear",
+  Accuracy = as.numeric(svm_confusion$overall["Accuracy"]),
+  Sensibilidade = as.numeric(svm_confusion$byClass["Sensitivity"]),
+  Especificidade = as.numeric(svm_confusion$byClass["Specificity"]),
+  Balanced_Accuracy = as.numeric(svm_confusion$byClass["Balanced Accuracy"]),
+  Kappa = as.numeric(svm_confusion$overall["Kappa"]),
+  AUC = svm_auc
+)
+
+# Criar versão arredondada apenas das colunas numéricas
+svm_metrics_round <- svm_metrics
+svm_metrics_round[, -1] <- round(svm_metrics_round[, -1], 4)
+
+cat("\n=== Métricas principais - SVM linear ===\n\n")
+print(svm_metrics_round)
+```
+
+*Interpretação*: O modelo SVM linear apresentou desempenho muito elevado no conjunto de teste, com accuracy de 0.9918. Este resultado indica que quase todas as amostras foram corretamente classificadas. A sensibilidade foi igual a 1.0000, mostrando que todas as amostras tumorais do conjunto de teste foram identificadas corretamente como Tumor. A Especificidade foi de 0.9286, indicando que a maioria das amostras normais também foi corretamente classificada, embora tenha ocorrido pelo menos um erro nesta classe.
+
+A balanced accuracy de 0.9643 é particularmente relevante devido ao desequilíbrio entre classes no conjunto de teste, que contém muitas mais amostras tumorais do que normais. Este valor mostra que o bom desempenho do modelo não resulta apenas da predominância da classe Tumor. O valor de Kappa de 0.9584 também indica uma concordância muito elevada entre as classes previstas e as classes reais, para além do que seria esperado por acaso.
+
+Estes resultados sugerem que o perfil de expressão dos 1000 genes selecionados contém informação suficiente para distinguir amostras tumorais e normais neste conjunto de dados. No entanto, como a avaliação foi realizada apenas neste dataset, a generalização do modelo deve ser interpretada com cautela e idealmente confirmada em dados externos independentes.
+
+### 13.5 Organização das probabilidades previstas
+
+As probabilidades previstas pelo modelo SVM linear foram organizadas numa tabela contendo, para cada amostra do conjunto de teste, a classe real, a classe prevista e as probabilidades atribuídas às classes Normal e Tumor. Esta tabela permite utilizar as probabilidades do SVM em análises posteriores, nomeadamente na construção de curvas ROC e na comparação com o modelo Random Forest.
+
+```{r}
+# Organizar probabilidades previstas no conjunto de teste
+
+svm_probabilidades_teste <- data.frame(
+  sample_id = rownames(x_test_svm),
+  classe_real = y_test_svm,
+  classe_prevista = svm_pred_test,
+  prob_Normal = svm_probabilities[, "Normal"],
+  prob_Tumor = svm_probabilities[, "Tumor"]
+)
+
+head(svm_probabilidades_teste)
+```
+
+### 13.6 Identificação dos genes mais influentes no SVM
+
+Como foi utilizado um kernel linear, o modelo SVM permitiu extrair pesos associados a cada gene. Estes pesos indicam a contribuição de cada variável para a fronteira de separação entre as classes. Assim, os genes com maior peso absoluto foram considerados os mais influentes na classificação entre amostras tumorais e normais.
+
+```{r}
+# Extração, anotação e exportação dos genes mais importantes do SVM linear
+
+svm_weights <- as.vector(t(svm_model_final$coefs) %*% svm_model_final$SV)
+names(svm_weights) <- colnames(x_train_svm)
+
+svm_gene_importance <- data.frame(
+  Gene = names(svm_weights),
+  Peso = svm_weights,
+  Peso_Absoluto = abs(svm_weights)
+) %>%
+  arrange(desc(Peso_Absoluto))
+
+cat("\n=== Top 20 genes por peso absoluto no SVM linear ===\n\n")
+print(head(svm_gene_importance, 20))
+
+
+# Anotação dos genes com nomes biológicos
+
+genes_info$ensembl_clean <- sub("\\..*", "", genes_info$ensembl_id)
+
+svm_gene_importance$ensembl_clean <- sub("\\..*", "", svm_gene_importance$Gene)
+
+svm_gene_importance <- svm_gene_importance %>%
+  left_join(
+    genes_info[, c("ensembl_clean", "gene_name")],
+    by = "ensembl_clean"
+  ) %>%
+  mutate(
+    gene_label = ifelse(
+      is.na(gene_name) | gene_name == "",
+      Gene,
+      gene_name
+    )
+  )
+
+svm_top20_genes <- svm_gene_importance %>%
+  slice(1:20)
+
+cat("\n=== Top 20 genes anotados - SVM linear ===\n\n")
+print(svm_top20_genes)
+
+print(svm_top20_genes[, c("Gene", "gene_name", "gene_label", "Peso", "Peso_Absoluto")])
+```
+
+*Interpretação*: A extração dos pesos do SVM linear permitiu identificar os genes com maior influência na fronteira de separação entre amostras tumorais e normais. Como o modelo utiliza um kernel linear, cada gene recebe um peso associado à sua contribuição para a classificação. Os genes foram ordenados pelo valor absoluto desse peso, uma vez que tanto pesos positivos como negativos podem representar uma influência importante no modelo, diferindo apenas no sentido da contribuição para a separação entre as classes.
+
+Entre os genes com maior peso absoluto surgem, por exemplo, IL6, DNAH11, KLK4, PLA2G2A, RPSAP53, MT3, CLMP e FAM246C. A presença de IL6 é biologicamente relevante, uma vez que este gene está associado a processos inflamatórios e de sinalização imunitária, frequentemente relacionados com o microambiente tumoral. A identificação de genes como PLA2G2A e MT3 também sugere que o modelo pode estar a captar alterações relacionadas com processos metabólicos, stress celular ou remodelação tecidular. No entanto, estes resultados devem ser interpretados com cautela, porque a importância no SVM reflete utilidade preditiva e não prova, por si só, causalidade ou expressão diferencial.
+Assim, os genes destacados pelo SVM devem ser vistos como uma assinatura preditiva capaz de contribuir para a distinção entre Tumor e Normal.
+
+### 13.7 Visualização dos genes mais influentes no SVM
+
+Para facilitar a interpretação dos genes mais importantes identificados pelo SVM linear, foi construído um gráfico com os 20 genes de maior peso absoluto.
+
+```{r}
+# Gráfico dos Top 20 genes mais influentes no SVM linear
+
+grafico_top20_svm <- ggplot(
+  svm_top20_genes,
+  aes(x = reorder(gene_label, Peso_Absoluto), y = Peso_Absoluto)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top 20 genes mais influentes no SVM linear",
+    x = "Gene",
+    y = "Peso Absoluto do Coeficiente"
+  ) +
+  theme_minimal()
+
+print(grafico_top20_svm)
+```
+
+*Interpretação*: O gráfico destaca os 20 genes com maior peso absoluto no modelo SVM linear, permitindo identificar de forma clara as variáveis que mais definem a fronteira de decisão entre amostras tumorais e normais. O destaque de genes como IL6, DNAH11, KLK4 e PLA2G2A reforça que o algoritmo se apoia numa assinatura transcriptómica específica para distinguir as duas classes.
+
+A análise através do peso absoluto foca-se na magnitude da influência de cada gene, independentemente da sua direção. Ou seja, genes com coeficientes positivos e negativos são igualmente decisivos para o modelo, diferindo apenas na classe para a qual orientam a previsão (tecido tumoral ou normal). Por fim, é fundamental ressalvar que o destaque dado a estes genes reflete um elevado poder preditivo (revelando-se excelentes biomarcadores), mas não comprova, por si só, que sejam a causa biológica do desenvolvimento tumoral.
+
+## 14 Machine learning: Random Forest
+
+O Random Forest é um algoritmo de ensemble learning adequado para dados transcriptómicos devido à sua capacidade de lidar com elevada dimensionalidade e de capturar interações não-lineares entre variáveis.
+
+Nesta abordagem, utilizaremos o conjunto de Treino balanceado (60%) para ensinar o modelo e o conjunto de Validação explícito (20%) para afinar o hiperparâmetro `mtry`. O modelo otimizado será depois avaliado de forma isenta no conjunto de Teste.
+
+### 14.1 Otimização do Hiperparâmetro mtry (Tuning)
+
+```{r}
+# 1. Definir os valores de mtry a testar (~ raiz quadrada de p = 1000 genes)
+mtry_valores <- c(31, 10, 50, 100)
+
+# Criar uma tabela para guardar os resultados da Validação
+resultados_val <- data.frame(mtry = numeric(), Accuracy = numeric())
+
+# 2. Ciclo para treinar e validar cada modelo
+set.seed(42) # FIXO
+for(m in mtry_valores) {
+  
+  # Treinar na train_matrix_sm sem validação cruzada interna (method = "none")
+  modelo_temp <- train(
+    x = train_matrix_sm,
+    y = train_labels_sm,
+    method = "rf",
+    ntree = 500,
+    tuneGrid = data.frame(mtry = m),
+    trControl = trainControl(method = "none")
+  )
+  
+  # Avaliar na val_matrix (Conjunto de Validação)
+  pred_temp <- predict(modelo_temp, newdata = val_matrix)
+  acc_temp  <- confusionMatrix(pred_temp, val_labels, positive = "Tumor")$overall["Accuracy"]
+  
+  # Guardar o resultado
+  resultados_val <- rbind(resultados_val, data.frame(mtry = m, Accuracy = acc_temp))
+}
+
+# Mostrar os resultados do tuning
+cat("=== Resultados do Tuning no Conjunto de Validação ===\n")
+print(resultados_val)
+
+# Extrair o melhor mtry
+best_mtry <- resultados_val$mtry[which.max(resultados_val$Accuracy)]
+cat(sprintf("\nO valor de mtry escolhido pela Validação foi: %d\n", best_mtry))
+```
+
+*Interpretação*: Os quatro valores de mtry testados produziram exatamente a mesma Accuracy no conjunto de Validação (≈ 99,18%), o que indica que o modelo é robusto à variação deste hiperparâmetro. Perante o empate, optou-se por fixar o mtry = 31. Este valor corresponde ao valor padrão do algoritmo para problemas de classificação, que estabelece como ideal a raiz quadrada do número total de preditores ($\sqrt{p}$). Sendo a nossa matriz composta pelos 1000 genes mais variáveis, obtemos $\sqrt{1000} \approx 31$. Para além de ser o valor default nativo do pacote randomForest, trata-se de um valor robusto e utilizado com frequência na literatura de transcriptómica (Díaz-Uriarte & Alvarez de Andrés, 2006). Quanto ao número de árvores, manteve-se o ntree = 500 (o valor default do algoritmo), uma vez que não se observou ganho preditivo ao testar valores superiores, como 1000, que só resultariam apenas num custo computacional maior e desnecessário.
+
+### 14.2 Treino do Modelo Final
+
+Com o melhor mtry identificado, treinamos o nosso modelo definitivo utilizando exclusivamente o conjunto de treino balanceado.
+
+```{r}
+set.seed(42) # FIXO
+
+# Treinar o modelo final com o melhor mtry nos 60% originais balanceados
+modelo_rf_final <- train(
+  x = train_matrix_sm,
+  y = train_labels_sm,
+  method = "rf",
+  ntree = 500,
+  tuneGrid = data.frame(mtry = best_mtry),
+  trControl = trainControl(method = "none"), # Já não precisamos de afinar nada
+  importance = TRUE
+)
+```
+
+### 14.3 Avaliação do Modelo no Conjunto de Teste
+
+De modo a garantir uma avaliação rigorosa e isenta de enviesamentos, o desempenho do modelo final foi medido recorrendo exclusivamente ao conjunto de teste (20% dos dados originais). Dado que estas amostras nunca foram expostas ao modelo durante o processo de treino ou otimização, representam um cenário de validação independente, permitindo estimar a verdadeira capacidade de previsão do algoritmo.
+
+```{r}
+# 1. Obter previsões de classes e probabilidades usando o modelo final
+rf_pred_class <- predict(modelo_rf_final, newdata = test_matrix)
+rf_pred_prob  <- predict(modelo_rf_final, newdata = test_matrix, type = "prob")
+
+probabilidades_rf <- data.frame(
+  sample_id = rownames(test_matrix),
+  classe_real = test_labels,
+  classe_prevista = rf_pred_class,
+  prob_Normal = rf_pred_prob[, "Normal"],
+  prob_Tumor = rf_pred_prob[, "Tumor"]
+)
+
+# 2. Avaliar métricas com matriz de confusão
+conf_mat_rf <- confusionMatrix(rf_pred_class, test_labels, positive = "Tumor")
+cat("\n=== Matriz de Confusão (Teste) ===\n")
+print(conf_mat_rf$table)
+
+# 3. Extrair métricas principais
+acc_rf  <- conf_mat_rf$overall["Accuracy"]
+sens_rf <- conf_mat_rf$byClass["Sensitivity"]
+spec_rf <- conf_mat_rf$byClass["Specificity"]
+
+# 4. Calcular a AUC (Área Sob a Curva ROC)
+roc_rf <- roc(response = test_labels, predictor = rf_pred_prob[, "Tumor"], levels = c("Normal", "Tumor"))
+auc_rf <- auc(roc_rf)
+
+cat(sprintf("\n=== Performance do Random Forest (Teste) ===\n"))
+cat(sprintf("Accuracy      : %.4f\n", acc_rf))
+cat(sprintf("Sensibilidade : %.4f\n", sens_rf))
+cat(sprintf("Especificidade: %.4f\n", spec_rf))
+cat(sprintf("AUC           : %.4f\n", auc_rf))
+```
+
+*Interpretação*: Os resultados obtidos no conjunto de teste revelam uma capacidade preditiva excelente por parte do modelo Random Forest, alcançando uma accuracy de 0.9918. O aspeto mais relevante deste desempenho é a sua sensibilidade perfeita (1.0000): o algoritmo conseguiu identificar corretamente todas as 108 amostras tumorais, sem registar um único falso negativo. Num contexto de diagnóstico oncológico, esta é a métrica mais crítica, uma vez que garante que nenhum paciente com carcinoma passaria despercebido.
+
+Relativamente à especificidade (0.9286), o modelo classificou corretamente 13 das 14 amostras de tecido normal. A matriz de confusão demonstra que ocorreu apenas um falso positivo (uma amostra normal classificada pelo modelo como sendo tumor). Na prática clínica, um falso positivo é geralmente considerado um erro muito mais tolerável do que um falso negativo, exigindo sobretudo exames de confirmação adicionais.
+
+Por fim, o valor da área sob a curva ROC (AUC = 0.9812) atesta a excelente capacidade global de discriminação do modelo entre as duas classes, independentemente do limiar de probabilidade escolhido. Em suma, o desempenho valida de forma clara que a assinatura transcriptómica utilizada (baseada nos 1000 genes mais variáveis) contém um forte sinal biológico, suficiente para separar com extrema precisão o tecido do carcinoma de células renais do tecido saudável.
+
+### 14.4 Importância das Variáveis (Top 20 Genes) e Enquadramento Biológico
+
+O algoritmo Random Forest permite aceder diretamente ao grau de importância de cada variável na construção do modelo preditivo. Ao extrairmos a importância destas variáveis, identificámos os 20 genes que mais contribuíram para a capacidade do modelo em separar as classes (Tumor vs. Normal) ao longo de todo o ensemble de árvores de decisão.
+
+```{r}
+# Extrair a importância das variáveis a partir do modelo treinado
+importancia_rf <- varImp(modelo_rf_final, scale = FALSE)
+
+# Limpar as versões dos IDs de todas as linhas da importância
+todos_ensembl_clean <- sub("\\..*", "", rownames(importancia_rf$importance))
+
+# Buscar os nomes dos genes correspondentes
+nomes_todos <- genes_info$gene_name[match(todos_ensembl_clean, genes_info$ensembl_clean)]
+
+# Substituir os rownames (se não encontrar um nome, mantém o ENSG original)
+rownames(importancia_rf$importance) <- ifelse(is.na(nomes_todos), rownames(importancia_rf$importance), nomes_todos)
+
+# Criar um data.frame com as importâncias, ordenar e selecionar o Top 20
+df_importancia_rf <- data.frame(
+  Gene = rownames(importancia_rf$importance),
+  Importancia = importancia_rf$importance[, 1]
+) %>%
+  arrange(desc(Importancia)) %>%
+  slice(1:20)
+
+# Isola os nomes para o vetor
+genes_importantes_rf <- df_importancia_rf$Gene
+
+# Gráfico dos Top 20 genes mais influentes no Random Forest
+grafico_top20_rf <- ggplot(
+  df_importancia_rf,
+  aes(x = reorder(Gene, Importancia), y = Importancia)
+) +
+  geom_col(fill = "dimgrey") + 
+  coord_flip() +
+  labs(
+    title = "Top 20 Genes - Importância no Modelo Random Forest",
+    x = "Gene",
+    y = "Score de Importância Bruta"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray30", size = 10)
+  )
+
+print(grafico_top20_rf)
+```
+
+*Interpretação*: A análise de importância do modelo Random Forest revelou que a sua elevada capacidade de distinção se baseia em marcadores moleculares com relevância biológica já consolidada no ccRCC. O gráfico destaca o gene TRPV6 com o maior score de importância bruta, posicionando-o como a variável mais determinante na construção das árvores de decisão e, consequentemente, na separação entre tecido normal e tumoral.O TRPV6 codifica uma proteína de canal iónico com elevada seletividade para o cálcio, a qual é expressa no tecido epitelial dos rins (Gong et al., 2022; Khattar et al., 2022).
+
+A sua seleção pelo algoritmo como principal preditor é biologicamente coerente, uma vez que perturbações na homeostase do cálcio estão frequentemente associadas a alterações na capacidade de proliferação e invasão celular em diversos cancros (Marchi & Pinton, 2016). Além disso, o TRPV6 e outros membros da família TRPV têm sido reportados como tendo um papel relevante em várias tipos de cancro, incluindo o ccRCC (Gong et al., 2022; Wang et al., 2024).
+
+Desta forma, a seleção empírica do TRPV6 pelo modelo de machine learning converge com o conhecimento biológico atual. O facto de um algoritmo focado na otimização preditiva destacar este gene no topo da sua hierarquia consolida o TRPV6 não apenas como um excelente discriminador matemático, mas reforça igualmente o seu potencial como biomarcador relevante para o ccRCC.
+
+## 15. Machine learning: PLS-DA
+
+O PLS-DA (Partial Least Squares Discriminant Analysis) é um método supervisionado que identifica componentes latentes que maximizam a separação entre classes, sendo especialmente adequado para dados de elevada dimensionalidade e com forte correlação interna, como os perfis transcriptómicos. O modelo foi treinado no conjunto balanceado por SMOTE, com o número de componentes (ncomp de 1 a 10) otimizado através da avaliação num conjunto de validação independente, tendo a AUC-ROC como métrica de seleção. As variáveis foram centradas e escaladas antes do treino.
+
+### 15.1 Otimização do número de componentes (Tuning)
+
+Nesta etapa, testamos diferentes números de componentes principais para encontrar o ponto ideal de separação das classes sem incorrer em sobreajustamento (overfitting).
+
+```{r}
+ncomp_valores <- 1:10
+resultados_val_pls <- data.frame(ncomp = numeric(), ROC = numeric())
+
+set.seed(42)
+for(n in ncomp_valores) {
+  
+  modelo_temp_pls <- train(
+    x        = as.data.frame(train_matrix_sm),
+    y        = train_labels_sm,
+    method   = "pls",
+    tuneGrid = data.frame(ncomp = n),
+    trControl = trainControl(
+      method          = "none",
+      classProbs      = TRUE,
+      summaryFunction = twoClassSummary
+    ),
+    metric     = "ROC",
+    preProcess = c("center", "scale")
+  )
+  
+  # Avaliar no val_matrix
+  prob_temp <- predict(modelo_temp_pls,
+                       newdata = as.data.frame(val_matrix),
+                       type    = "prob")[, "Tumor"]
+  
+  roc_temp <- pROC::roc(response  = val_labels,
+                        predictor = prob_temp,
+                        levels    = c("Normal", "Tumor"),
+                        direction = "<",
+                        quiet     = TRUE)
+  
+  resultados_val_pls <- rbind(resultados_val_pls,
+                              data.frame(ncomp = n, ROC = as.numeric(pROC::auc(roc_temp))))
+}
+
+cat("=== Resultados do Tuning PLS-DA no Conjunto de Validação ===\n")
+print(resultados_val_pls)
+
+best_ncomp <- resultados_val_pls$ncomp[which.max(resultados_val_pls$ROC)]
+cat(sprintf("\nO valor de ncomp escolhido pela Validação foi: %d\n", best_ncomp))
+```
+
+*Interpretação:* Os resultados mostram que o valor de ncomp = 1 já atinge um desempenho máximo (AUC = 1.0), indicando uma separação perfeita entre classes no conjunto de validação. Embora outros valores de ncomp também apresentem AUC muito elevadas (próximas ou iguais a 1), a escolha de ncomp = 1 é preferível com base no princípio da parcimónia (Occam’s razor), que favorece modelos mais simples quando o desempenho é equivalente.
+
+A utilização de apenas uma componente latente sugere que a maior parte da informação discriminativa entre tecido tumoral e normal pode ser capturada numa única dimensão projetada. A adição de mais componentes não melhora o desempenho do modelo, o que indica que estas componentes adicionais poderão estar a capturar variabilidade residual ou ruído, sem contributo relevante para a predição.
+
+### 15.2 Treino do Modelo Final e Avaliação no Conjunto de Teste
+
+De modo a garantir a comparabilidade com os algoritmos anteriores, o modelo PLS-DA final foi avaliado exclusivamente no conjunto de teste independente.
+
+```{r}
+# --- Modelo Final com o melhor ncomp ---
+set.seed(42)
+pls_modelo <- train(
+  x          = as.data.frame(train_matrix_sm),
+  y          = train_labels_sm,
+  method     = "pls",
+  tuneGrid   = data.frame(ncomp = best_ncomp),
+  trControl  = trainControl(method = "none", classProbs = TRUE),
+  preProcess = c("center", "scale")
+)
+
+# Previsões no Test Set
+pred_pls <- predict(pls_modelo, newdata = as.data.frame(test_matrix))
+prob_pls <- predict(pls_modelo, newdata = as.data.frame(test_matrix), type = "prob")[, "Tumor"]
+
+# Métricas
+conf_mat_pls <- confusionMatrix(pred_pls, test_labels, positive = "Tumor")
+cat("\n=== Matriz de Confusão (Teste) ===\n")
+print(conf_mat_pls$table)
+
+# Extrair métricas para formatação consistente
+acc_pls  <- conf_mat_pls$overall["Accuracy"]
+sens_pls <- conf_mat_pls$byClass["Sensitivity"]
+spec_pls <- conf_mat_pls$byClass["Specificity"]
+
+roc_pls_test <- pROC::roc(response = test_labels, predictor = prob_pls, levels = c("Normal", "Tumor"), direction = "<", quiet = TRUE)
+auc_pls <- as.numeric(pROC::auc(roc_pls_test))
+
+cat(sprintf("\n=== Performance do PLS-DA (Teste) ===\n"))
+cat(sprintf("Accuracy      : %.4f\n", acc_pls))
+cat(sprintf("Sensibilidade : %.4f\n", sens_pls))
+cat(sprintf("Especificidade: %.4f\n", spec_pls))
+cat(sprintf("AUC           : %.4f\n", auc_pls))
+```
+*Interpretação:* Os resultados da avaliação no conjunto de teste demonstram que o modelo PLS-DA apresenta uma elevada capacidade discriminativa, alcançando uma accuracy de 0,9754. A sensibilidade obtida foi de 0,9815, uma vez que o algoritmo conseguiu identificar corretamente 106 das 108 amostras tumorais. Consequentemente, o modelo registou dois falsos negativos, ou seja, duas amostras tumorais classificadas incorretamente como tecido normal. Num contexto clínico oncológico, este é um fator de alerta, dado o risco acrescido associado a falhas no diagnóstico de um doente.
+
+Relativamente à especificidade (0,9286), o modelo demonstrou um bom desempenho, classificando corretamente 13 das 14 amostras de tecido normal e registando apenas um falso positivo.
+
+Por fim, a área sob a curva ROC (AUC = 0,9590) confirma a robustez global do modelo na separação das duas classes, condensando a complexidade dos 1000 genes numa única componente latente.
+
+Em suma, o modelo revela métricas excelentes.
+
+### 15.3 Importância das Variáveis (Top 20 Genes) e Enquadramento Biológico
+
+```{r}
+# Extrair a importância das variáveis a partir do modelo treinado
+importancia_pls <- varImp(pls_modelo, scale = FALSE)
+
+# Limpar as versões dos IDs de todas as linhas da importância
+todos_ensembl_clean_pls <- sub("\\..*", "", rownames(importancia_pls$importance))
+
+# Buscar os nomes dos genes correspondentes
+nomes_todos_pls <- genes_info$gene_name[match(todos_ensembl_clean_pls, genes_info$ensembl_clean)]
+
+# Substituir os rownames (se não encontrar um nome, mantém o ENSG original)
+rownames(importancia_pls$importance) <- ifelse(is.na(nomes_todos_pls), rownames(importancia_pls$importance), nomes_todos_pls)
+
+# Criar um data.frame com as importâncias, ordenar e selecionar o Top 20
+df_importancia_pls <- data.frame(
+  Gene = rownames(importancia_pls$importance),
+  Importancia = importancia_pls$importance[, 1]
+) %>%
+  arrange(desc(Importancia)) %>%
+  slice(1:20)
+
+# Gráfico dos Top 20 genes mais influentes no PLS-DA
+grafico_top20_pls <- ggplot(
+  df_importancia_pls,
+  aes(x = reorder(Gene, Importancia), y = Importancia)
+) +
+  geom_col(fill = "dimgrey") + 
+  coord_flip() +
+  labs(
+    title = "Top 20 Genes - Importância no Modelo PLS-DA",
+    x = "Gene",
+    y = "Score de Importância Bruta"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+print(grafico_top20_pls)
+```
+
+**Interpretação:** O gráfico apresenta os 20 genes com maior importância no modelo PLS-DA. No eixo dos yy encontram-se os genes, enquanto o eixo dos xx representa o score de importância bruta, que traduz o contributo de cada gene para a capacidade do modelo em distinguir entre tecido tumoral e normal. Valores mais elevados indicam maior influência na construção da componente latente e, consequentemente, na predição.
+
+Verifica-se que os valores de importância são relativamente próximos entre si, o que sugere que o modelo não depende de um único gene, mas sim de um conjunto de genes que, em conjunto, contribuem para a separação entre as classes.
+
+Do ponto de vista biológico, alguns dos genes mais relevantes são consistentes com o contexto renal. Por exemplo, AQP2 está diretamente envolvido no transporte de água nos túbulos renais, sendo essencial para a função do rim (Kwon et al., 2013), enquanto UMOD é um gene característico do tecido renal, associado à função tubular (Melchinger et al., 2022). A seleção destes genes pelo modelo indica que este está a captar padrões biologicamente plausíveis, reforçando a credibilidade dos resultados obtidos.
+
+## 16. Comparação Final de Modelos (Curvas ROC)
+
+A comparação final dos três modelos — Random Forest, SVM Linear e PLS-DA — foi realizada através das curvas ROC e respetivas AUC no mesmo conjunto de teste, garantindo uma avaliação justa e sem data leakage. As probabilidades foram extraídas de forma adequada a cada algoritmo: no RF via proporção de votos das árvores, no SVM via Platt scaling (probability = TRUE), e no PLS-DA via probabilidade posterior do caret. Os objetos ROC foram construídos com pROC::roc() com levels e direction explícitos para garantir orientação correta.
+
+```{r}
+# Probabilidades de cada modelo no conjunto de Teste
+
+# Random Forest: prob_Tumor já calculada na secção 14.2
+prob_rf <- predict(modelo_rf_final, newdata = test_matrix, type = "prob")[, "Tumor"]
+
+# SVM (e1071): usar predict com probability=TRUE e extrair atributo
+svm_pred_raw <- predict(svm_model_final, newdata = x_test_svm, probability = TRUE)
+prob_svm     <- attr(svm_pred_raw, "probabilities")[, "Tumor"]
+
+# PLS-DA: prob_pls já calculada na secção 15
+# (prob_pls <- predict(pls_modelo, newdata = as.data.frame(test_matrix), type = "prob")[, "Tumor"])
+# Caso não esteja no ambiente, recalcular:
+prob_pls <- predict(pls_modelo, newdata = as.data.frame(test_matrix), type = "prob")[, "Tumor"]
+
+# Gerar os objetos ROC
+roc_rf  <- pROC::roc(response = test_labels, predictor = prob_rf,
+                     levels = c("Normal", "Tumor"), direction = "<", quiet = TRUE)
+roc_svm <- pROC::roc(response = test_labels, predictor = prob_svm,
+                     levels = c("Normal", "Tumor"), direction = "<", quiet = TRUE)
+roc_pls <- pROC::roc(response = test_labels, predictor = prob_pls,
+                     levels = c("Normal", "Tumor"), direction = "<", quiet = TRUE)
+
+# Visualização Comparativa 
+plot(roc_rf,  col = "red",   lwd = 2, main = "Comparação de Modelos - Curvas ROC")
+lines(roc_svm, col = "blue",  lwd = 2)
+lines(roc_pls, col = "green", lwd = 2)
+
+legend("bottomright",
+       legend = c(paste0("Random Forest (AUC = ", round(auc(roc_rf),  3), ")"),
+                  paste0("SVM Linear   (AUC = ", round(auc(roc_svm), 3), ")"),
+                  paste0("PLS-DA       (AUC = ", round(auc(roc_pls), 3), ")")),
+       col = c("red", "blue", "green"),
+       lwd = 2)
+```
+*Interpretação:* A análise comparativa das curvas ROC consolida o excelente desempenho preditivo alcançado transversalmente nesta fase do estudo. Os três modelos atingiram valores de Área Sob a Curva (AUC) excecionais, evidenciando uma elevada capacidade de discriminação global, independentemente do limiar de probabilidade escolhido. O Random Forest obteve o desempenho superior (AUC = 0.981), seguido de perto pelo SVM Linear (AUC = 0.969) e pelo PLS-DA (AUC = 0.959).
+
+Visualmente, a ascensão quase vertical das três curvas em direção ao quadrante superior esquerdo demonstra que todos os algoritmos conseguem atingir níveis muito altos de sensibilidade sem sacrificar a especificidade, ou seja, sem cometer erros significativos de falsos positivos.
+
+Um resultado de grande relevo é também a convergência de desempenhos dos modelos. O facto dos três algorítmicos fundamentalmente distintos atingirem desempenhos quase perfeitos prova, de forma inequívoca, a qualidade da matriz de dados de entrada. Esta concordância entre modelos valida a robustez da assinatura transcriptómica subjacente: os 1000 genes mais variáveis selecionados contêm um sinal biológico muito forte, capaz de separar o tecido saudável do ccRCC com extrema fiabilidade.
+
+**Conclusões:**
+
+Este estudo apresenta uma análise transcriptómica integrada do ccRCC, com base nos dados do TCGA-KIRC. A execução de um pipeline analítico abrangente, desde a extração e normalização de dados até à classificação preditiva via algoritmos de machine learning, culminou em resultados consistentes e em linha com o descrito na literatura para esta patologia.
+
+A análise de expressão diferencial revelou uma profunda reprogramação transcricional, identificando 10.310 genes significativamente alterados no tecido neoplásico. O enriquecimento funcional destas assinaturas evidenciou duas dinâmicas biológicas centrais: a sobrexpressão de cascatas imunitárias e inflamatórias, consistente com a densa infiltração do microambiente tumoral típica do ccRCC; e a acentuada supressão de vias metabólicas e de transporte tubular, refletindo a perda da identidade celular diferenciada e o abandono das funções fisiológicas normais. Estes programas transcriptómicos foram validados pela análise não supervisionada, que isolou com sucesso módulos de co-expressão distintos, nomeadamente o Módulo 1, associado ao tecido renal normal, e o Módulo 4, associado ao fenótipo tumoral, revelando uma sobreposição muito expressiva com os perfis de expressão diferencial obtidos na Fase 1.
+
+No domínio da classificação, os três modelos de machine learning desenvolvidos (SVM Linear, Random Forest e PLS-DA) demonstraram desempenhos preditivos de excelência no conjunto de teste independente, atingindo valores de AUC próximos de 1.0 e accuracy próxima ou superior a 99%. A convergência destes três paradigmas algorítmicos atesta, de forma inequívoca, a robustez metodológica da abordagem e a elevada qualidade da assinatura transcriptómica extraída.
+
+Não obstante, a presente análise apresenta limitações, com destaque para o acentuado desequilíbrio de classes na base de dados original (541 amostras tumorais versus 72 normais). Embora este enviesamento tenha sido corrigido durante a fase de treino através do algoritmo SMOTE, garantindo que os modelos aprendessem a identificar ambas as condições de forma equilibrada, a aplicação prática destes resultados requer cuidado. Uma vez que todos os dados provêm da mesma fonte (TCGA-KIRC), a verdadeira capacidade de generalização destes modelos preditivos para o contexto clínico necessita ainda de ser comprovada utilizando conjuntos de dados externos e totalmente independentes.
+
+**Referências:**
+
+Cancer Genome Atlas Research Network. (2013). Comprehensive molecular characterization of clear cell renal cell carcinoma. Nature, 499(7456), 43–49. https://doi.org/10.1038/nature12222
+
+Deng, J., Xing, Y., Jia, L., Li, P., Yang, Y., Huang, M., Wang, M., Su, Z., Jiang, G., Hu, Y., & Wang, J. (2024). Diagnostic, predictive and prognostic molecular biomarkers in clear cell renal cell carcinoma. Cells, 13(11), Artigo 900. https://doi.org/10.3390/cells13110900
+
+Gong, Z., Xie, J., Chen, L., Tang, Q., Hu, Y., Xu, A., & Wang, Z. (2022). Integrative analysis of TRPV family to prognosis and immune infiltration in renal clear cell carcinoma. Channels, 16(1), 84–96. https://doi.org/10.1080/19336950.2022.2058733
+
+Hu, J., Wang, S.-G., Hou, Y., Chen, Z., Liu, L., Li, R., Li, N., Zhou, L., Yang, Y., Wang, L., Wang, L., Yang, X., Lei, Y., Deng, C., Li, Y., Deng, Z., Ding, Y., Kuang, Y., Yao, Z., ... Li, F. (2024). Multi-omic profiling of clear cell renal cell carcinoma identifies metabolic reprogramming associated with disease progression. Nature Genetics, 56(3), 442–457. https://doi.org/10.1038/s41588-024-01662-5
+
+Kadomoto, S., Izumi, K., Hiratsuka, K., Nakano, T., Naito, R., Makino, T., Iwamoto, H., Yaegashi, H., Shigehara, K., Kadono, Y., Nakata, H., Saito, Y., Nakagawa-Goto, K., & Mizokami, A. (2020). Tumor-associated macrophages induce migration of renal cell carcinoma cells via activation of the CCL20-CCR6 axis. Cancers, 12(1), Artigo 89. https://doi.org/10.3390/cancers12010089
+
+Khattar, V., Wang, L., & Peng, J.-B. (2022). Calcium selective channel TRPV6: Structure, function, and implications in health and disease. Gene, 817, Artigo 146192. https://doi.org/10.1016/j.gene.2022.146192
+
+Kim, D. H., & Rossi, J. J. (2008). RNAi mechanisms and applications. BioTechniques, 44(5), 613–616. https://doi.org/10.2144/000112792
+
+Kwon, T.-H., Frøkiær, J., & Nielsen, S. (2013). Regulation of aquaporin-2 in the kidney: A molecular mechanism of body-water homeostasis. Kidney Research and Clinical Practice, 32(3), 96–102. https://doi.org/10.1016/j.krcp.2013.07.005
+
+Lau, A., Rahn, J. J., Chappellaz, M., Chung, H., Benediktsson, H., Bihan, D., & Muruve, D. A. (2022). Dipeptidase-1 governs renal inflammation during ischemia reperfusion injury. Science Advances, 8(5), eabm0142. https://doi.org/10.1126/sciadv.abm0142
+
+Lewis, S., Chen, L., Raghuram, V., Khundmiri, S. J., Chou, C.-L., Yang, C.-R., & Knepper, M. A. (2021). SLC-omics of the kidney: Solute transporters along the nephron. American Journal of Physiology-Cell Physiology, 321(3), C507-C518. https://doi.org/10.1152/ajpcell.00197.2021
+
+Li, Q., Shi, Z., Shi, X., Xing, H., Zhang, Y., Zhuang, S., & Chang, M. (2026). Peroxisome proliferator-activated receptors in kidney diseases: A promising therapeutic target. Biomedicine & Pharmacotherapy, 195, Artigo 118983. https://doi.org/10.1016/j.biopha.2026.118983
+
+Linehan, W. M., Srinivasan, R., & Schmidt, L. S. (2010). The genetic basis of kidney cancer: A metabolic disease. Nature Reviews Urology, 7(5), 277–285. https://doi.org/10.1038/nrurol.2010.47
+
+Liu, J., Lichtenberg, T., Hoadley, K. A., Poisson, L. M., Lazar, A. J., Cherniack, A. D., Kovatich, A. J., Benz, C. C., Levine, D. A., Lee, A. V., Omberg, L., Wolf, D. M., Shriver, C. D., Thorsson, V., Hu, H., Caesar-Johnson, S. J., Demchok, J. A., Felau, I., ... Zhang, J. J. (2018). An integrated TCGA pan-cancer clinical data resource to drive high-quality survival outcome analytics. Cell, 173(2), 400–416.e11. https://doi.org/10.1016/j.cell.2018.02.052
+
+Marchi, S., & Pinton, P. (2016). Alterations of calcium homeostasis in cancer cells. Current Opinion in Pharmacology, 29, 1–6. https://doi.org/10.1016/j.coph.2016.03.002
+
+Mattila, K. E., Vainio, P., & Jaakkola, P. M. (2022). Prognostic factors for localized clear cell renal cell carcinoma and their application in adjuvant therapy. Cancers, 14(1), Artigo 239. https://doi.org/10.3390/cancers14010239
+
+Melchinger, H., Calderon-Gutierrez, F., Obeid, W., Xu, L., Shaw, M. M., Luciano, R. L., Kuperman, M., Moeckel, G. W., Kashgarian, M., Wilson, F. P., Parikh, C. R., & Moledina, D. G. (2022). Urine Uromodulin as a Biomarker of Kidney Tubulointerstitial Fibrosis. Clinical Journal of the American Society of Nephrology, 17(9), 1284. https://doi.org/10.2215/CJN.04360422
+
+Monjaras-Avila, C. U., Lorenzo-Leal, A. C., Luque-Badillo, A. C., D’Costa, N., Chavez-Muñoz, C., & Bach, H. (2023). The tumor immune microenvironment in clear cell renal cell carcinoma. International Journal of Molecular Sciences, 24(9), Artigo 7946. https://doi.org/10.3390/ijms24097946
+
+Qu, Y., Feng, J., Wu, X., Bai, L., Xu, W., Zhu, L., Liu, Y., Xu, F., Zhang, X., Yang, G., Lv, J., Chen, X., Shi, G.-H., Wang, H.-K., Cao, D.-L., Xiang, H., Li, L., Tan, S., Gan, H.-L., ... Ding, C. (2022). A proteogenomic analysis of clear cell renal cell carcinoma in a Chinese population. Nature Communications, 13(1), Artigo 2052. https://doi.org/10.1038/s41467-022-29577-x
+
+Wang, Y., Deng, X., Zhang, R., Lyu, H., Xiao, S., Guo, D., Ali, D. W., Michalak, M., Zhou, C., Chen, X.-Z., & Tang, J. (2024). The TRPV6 Calcium Channel and Its Relationship with Cancer. Biology, 13(3), Artigo 168. https://doi.org/10.3390/biology13030168
+
+Wettersten, H. I., Aboud, O. A., Lara, P. N., & Weiss, R. H. (2017). Metabolic reprogramming in clear cell renal cell carcinoma. Nature Reviews Nephrology, 13(7), 410–419. https://doi.org/10.1038/nrneph.2017.59
+
+Xie, J., Ni, F., Shao, J., Zhang, D., Guo, T., & Wang, X. (2026). Amino acid metabolic reprogramming in clear cell renal cell carcinoma: Pathogenic mechanisms and therapeutic targeting. Cancer Letters, 640, Artigo 218244. https://doi.org/10.1016/j.canlet.2026.218244
+
+Young, M., Jackson-Spence, F., Beltran, L., Day, E., Suarez, C., Bex, A., Powles, T., & Szabados, B. (2024). Renal cell carcinoma. The Lancet, 404(10451), 476–491. https://doi.org/10.1016/S0140-6736(24)00917-6
+
+
+
