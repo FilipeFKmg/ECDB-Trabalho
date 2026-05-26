@@ -11,7 +11,6 @@ O objetivo deste projeto é a análise de um conjunto de dados de expressão gen
 
 ## Organização do Repositório
 
-* `data/`: Diretória destinada ao armazenamento dos dados (ficheiros clínicos e matrizes de expressão descarregados).
 * `scripts/`: Contém os ficheiros de código R utilizados em cada fase da análise.
 * `reports/`: Contém os relatórios finais gerados em formato HTML através do R Markdown, documentando os resultados e as discussões.
 
